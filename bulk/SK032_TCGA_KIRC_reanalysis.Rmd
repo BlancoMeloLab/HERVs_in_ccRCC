@@ -1,0 +1,1023 @@
+---
+title: "TCGA-KIRC HERVdb v13"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load}
+library(DESeq2) 
+library(RColorBrewer)
+library(pheatmap)
+library(viridis)
+library(ggplot2)
+library(tximport)
+library(edgeR)
+#library(EnhancedVolcano)
+library(patchwork)
+library(tidyverse)
+library(reshape2)
+library(data.table)
+library(stringr)
+library(readxl)
+library(ggVennDiagram)
+library(readr)
+library(clusterProfiler)
+library(biomaRt)
+library(MetBrewer)
+library(ggpubr)
+library(rstatix)
+```
+
+```{r load sample info}
+samples <- read.csv("data/annotations/sample_id_map.csv", header = TRUE)
+
+samples$tsv_file_name <- gsub(".bam", ".combined_counts.tsv", samples$file_name)
+samples$tsv_file_name <- gsub("-", "\\.", samples$tsv_file_name)
+
+length(unique(samples$tsv_file_name))
+
+# remove duplicate sample files, keeping the resequenced version where applicable
+removed <- c("TCGA-B2-3923-01A-02R-A277-07",
+             "TCGA-B2-3923-01B-10R-A277-07",
+             "TCGA-B2-3924-01A-02R-A277-07",
+             "TCGA-B2-5633-01A-01R-A277-07",
+             "TCGA-B2-5635-01A-01R-A277-07",
+             "TCGA-DV-A4W0-05A-11R-A266-07")
+which(samples$entity_submitter_id %in% removed)
+removed <- c(44, 111, 458, 471, 508, 550)
+removed_files <- samples[removed, ]
+samples <- samples[-removed, ]
+
+samples$samples <- gsub(" ", "_", samples$samples)
+
+samples <- samples %>%
+  mutate(abv_id = str_extract(entity_submitter_id, "TCGA-\\w+-\\w+")) %>%
+  mutate(sample_id = str_extract(entity_submitter_id, "TCGA-\\w+-\\w+-\\d+\\w"))
+```
+
+```{r format counts -- SKIP}
+# Read in per-sample counts files and merge into a single matrix;
+# features absent from a given sample are assigned 0 counts
+files <- list.files("data/counts/", pattern = "*.tsv", full.names = TRUE)
+names(files) <- basename(files)
+data_list <- lapply(files, read.table, header = TRUE)
+merged_data <- Reduce(function(x, y) merge(x, y, by = "feature_id", all = TRUE), data_list)
+colnames(merged_data) <- c("feature_id", names(data_list))
+merged_data[is.na(merged_data)] <- 0
+merged_data <- merged_data %>% dplyr::filter(!str_detect(feature_id, "^_"))
+
+remove_cols <- which(str_extract(colnames(merged_data), "^.*.rna") %in% str_extract(removed_files$file_name, "^.*.rna"))
+merged_data <- merged_data[, -remove_cols]
+
+row.names(merged_data) <- merged_data$feature_id
+merged_data <- merged_data[, -1]
+
+samples$tsv_file_name[which(samples$tsv_file_name %notin% colnames(merged_data))]
+
+colnames(merged_data) <- gsub("-", "\\.", colnames(merged_data))
+samples <- samples[match(colnames(merged_data), samples$tsv_file_name), ]
+colnames(merged_data) <- samples$sample_id
+
+#write.csv(merged_data, "data/counts_merged.csv", quote = F)
+```
+
+```{r DESEQ2}
+counts <- read.csv("data/counts_merged.csv", row.names = 1)
+colnames(counts) <- gsub("\\.", "-", colnames(counts))
+samples <- samples[match(colnames(counts), samples$sample_id), ]
+
+sampleTable <- data.frame(
+  condition = factor(samples$samples),
+  abv_id = factor(samples$abv_id),
+  sample_id = factor(samples$sample_id)
+)
+
+colnames(counts) <- sampleTable$sample_id
+rownames(sampleTable) <- sampleTable$sample_id
+
+dds <- DESeqDataSetFromMatrix(counts,
+                                colData = sampleTable,
+                                design = ~ condition)
+
+dds <- DESeq(dds)
+```
+
+```{r PCA}
+vsd <- vst(dds, blind = FALSE)
+plotPCA(vsd, intgroup = c("condition")) +
+  scale_color_manual(values = c("#00BFC4", "#F8766D")) +
+  ggtitle("TCGA-KIRC PCA") +
+  theme_classic()
+
+#ggsave("output/tcga_kirc_pca.pdf", width = 6, height = 6)
+```
+
+```{r run contrasts}
+res_TvsN <- results(dds, contrast = c("condition", "Solid_Tissue_Normal", "Primary_Tumor"))
+res_TvsN <- res_TvsN[complete.cases(res_TvsN), ]
+result_TvsN <- res_TvsN[order(res_TvsN$padj), ]
+
+all_res <- data.frame(result_TvsN) %>% filter(str_detect(rownames(.), "RBRT"))
+
+DEH <- data.frame(result_TvsN[which(abs(result_TvsN$log2FoldChange) > 1 & result_TvsN$padj < 0.05), ])
+#write.csv(DEH, "output/tcga_kirc_degs.csv", row.names = T, quote = F)
+DEH <- DEH %>%
+  filter(str_detect(rownames(DEH), "RBRT")) %>%
+  filter(log2FoldChange <= -1) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(idx = row.names(.))
+
+annot <- read.table("data/annotations/hervs_v13_to_v6_compare.tsv", sep = "\t", header = TRUE)
+#write.csv(DEH, "output/tcga_kirc_deh.csv", quote = F)
+```
+
+```{r compare}
+# compare TCGA-derived DE HERVs against the independent patient cohort
+n8 <- read.csv("data/results/patients_deh_results.csv")
+
+shared <- DEH[DEH$idx %in% n8$idx, ]
+
+hervdb <- read.table("data/annotations/hervs_8k.gtf", sep = "\t") %>%
+  mutate(family = str_extract(V9, "gene_id .*; tr")) %>%
+  dplyr::select(V2, family)
+
+hervdb$family <- gsub("gene_id RBRT\\d+-", "", hervdb$family)
+hervdb$family <- gsub("; tr", "", hervdb$family)
+colnames(hervdb)[1] <- "idx"
+
+shared <- left_join(shared, hervdb)
+#write.csv(shared, "output/shared_deh.csv", quote = F)
+table(shared$family)
+
+hervs_8k <- read.table("data/annotations/hervs_nsltr_corr_8k.tsv", header = TRUE)
+```
+
+```{r MA plot}
+gene_names <- DEH %>% filter(log2FoldChange < 0) %>% arrange(desc(baseMean), log2FoldChange)
+gene_names <- as.vector(row.names(gene_names))
+gene_names <- gene_names[1:15]
+
+length(which(all_res$log2FoldChange >= 1))
+length(which(all_res$log2FoldChange <= -1))
+
+ggmaplot(all_res, main = "MA plot of TCGA-KIRC tumor vs normal DE HERVs",
+   fdr = 0.05, fc = 2, size = 0.4,
+   palette = c("#B31B21", "#1465AC", "darkgray"),
+   label.select = gene_names,
+   legend = "top", top = 0,
+   font.label = c("bold", 11),
+   font.legend = "bold",
+   font.main = "bold",
+   ggtheme = ggplot2::theme_minimal())
+
+#ggsave("output/tcga_ma_de_herv.pdf", width = 5, height = 5)
+```
+
+```{r heatmap but apply FC and expression filter}
+# expression threshold per Telescope paper: CPM 0.5 x 10 samples
+cpm <- cpm(counts)
+
+sub_cpm <- filter(as.data.frame(cpm), row.names(cpm) %in% row.names(DEH))
+
+annotation <- sampleTable %>% select(condition)
+annotation <- annotation %>% arrange(factor(row.names(annotation), levels = colnames(sub_cpm)))
+
+# expression filter based on tumor samples only
+tumor <- annotation %>% filter(condition == "Primary_Tumor")
+tumor_exp <- as.data.frame(sub_cpm) %>% dplyr::select(row.names(tumor))
+rown <- row.names(tumor_exp)
+tumor_exp <- tumor_exp %>%
+  mutate(idx = row.names(tumor_exp)) %>%
+  rowwise() %>%
+  mutate(med = median(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  mutate(ave = mean(c_across(where(is.numeric)), na.rm = TRUE))
+row.names(tumor_exp) <- rown
+
+# select loci with highest fold change and highest median tumor expression
+tumor_exp <- merge(tumor_exp, DEH, by = "idx")
+tumor_exp <- tumor_exp %>% arrange(desc(med), log2FoldChange)
+
+top25 <- tumor_exp$idx[1:15]
+
+hi_fc_exp <- filter(as.data.frame(cpm), row.names(cpm) %in% top25)
+
+ann_colors <- list(condition = c(Primary_Tumor = "cyan1", Solid_Tissue_Normal = "coral1"))
+mat_breaks <- c(0, 1, 5, 10, 15, 20)
+
+main <- "high exp, hi FC DE Tumor up hervs -- CPM, manual breaks, median exp"
+
+pheatmap(hi_fc_exp,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         clustering_method = "mcquitty",
+         clustering_distance_rows = "euclidean",
+         breaks = mat_breaks,
+         color = inferno(length(mat_breaks) - 1),
+         main = main,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         clustering_distance_cols = "euclidean",
+         annotation = annotation,
+         annotation_colors = ann_colors,
+         border_color = NA,
+         legend = TRUE, annotation_legend = FALSE)
+#ggsave("output/tcga_hi_exp_fc_filt_de_hervs_hm.pdf", width = 8.5, height = 8.5)
+```
+
+```{r barplots}
+cpm <- cpm(counts)
+
+hoi <- c("RBRT304117", "RBRT162940", "RBRT190212", "RBRT11613", "RBRT424674", "RBRT442033")
+
+cpm <- as.data.frame(cpm) %>% filter(row.names(cpm) %in% hoi)
+cpm <- t(cpm)
+row.names(sampleTable) <- sampleTable$sample_id
+cpm <- merge(cpm, sampleTable, by = "row.names")
+
+cpm <- gather(as.data.frame(cpm), key = "herv", value = "value", c(RBRT11613:RBRT442033))
+my_comparisons <- list(c("normal", "tumor"))
+
+summary_data <- cpm %>%
+  group_by(condition, herv) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE),
+            sd_value = sd(value, na.rm = TRUE))
+
+stats_results <- cpm %>%
+  group_by(herv) %>%
+  t_test(value ~ condition) %>%
+  adjust_pvalue(method = "none") %>%
+  add_significance("p") %>%
+  add_xy_position(x = "condition", scales = "free_y", step.increase = 0.25)
+
+gg_list <- list()
+for (i in unique(cpm$herv)) {
+  data <- cpm[which(cpm$herv[] == i), ]
+  summary_sub <- summary_data[which(summary_data$herv == i), ]
+  stats_sub <- stats_results[which(stats_results$herv == i), ]
+  gg_list[[i]] <- ggplot(data, aes(x = condition, y = value, group = condition)) +
+    labs(title = paste(i)) +
+    theme_classic() +
+    geom_boxplot(aes(fill = condition)) +
+    geom_point() +
+    theme(text = element_text(size = 10), axis.text.x = element_text(size = 10, angle = 45, hjust = 1)) +
+    ylab("CPM") +
+    geom_errorbar(data = summary_sub,
+                  aes(x = condition, y = mean_value,
+                      ymin = mean_value - sd_value,
+                      ymax = mean_value + sd_value, group = condition),
+                  width = 0.2,
+                  color = "black") +
+    stat_pvalue_manual(stats_sub,
+                        label = "p.signif",
+                        tip.length = 0.01,
+                        size = 3,
+                        hide.ns = FALSE)
+
+  print(gg_list[[i]])
+  #ggsave(filename = paste0("output/cpm_", i, ".pdf"), width = 6, height = 6)
+}
+```
+
+```{r specific DE HERVS}
+cpm <- cpm(counts)
+
+hoi <- c("RBRT304117", "RBRT162940", "RBRT190212", "RBRT11613", "RBRT226772", "RBRT442488")
+sub_cpm <- filter(as.data.frame(cpm), row.names(cpm) %in% hoi)
+
+ann_colors <- list(condition = c(Primary_Tumor = "cyan1", Solid_Tissue_Normal = "coral1"))
+mat_breaks <- c(0, 1, 5, 10, 15, 20)
+
+main <- "TCGA-KIRC: HERVs of interest"
+
+pheatmap(sub_cpm,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         clustering_method = "mcquitty",
+         clustering_distance_rows = "euclidean",
+         breaks = mat_breaks,
+         color = inferno(length(mat_breaks) - 1),
+         main = main,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         clustering_distance_cols = "euclidean",
+         annotation = annotation,
+         annotation_colors = ann_colors,
+         border_color = NA,
+         legend = TRUE, annotation_legend = FALSE)
+```
+
+# plotting HERV-E elements in general 
+```{r}
+hervdb <- read.table("data/annotations/hervs_8k.gtf", sep = "\t") %>%
+  mutate(family = str_extract(V9, "gene_id .*; tr")) %>%
+  dplyr::select(V2, family)
+
+hervdb$family <- gsub("gene_id RBRT\\d+-", "", hervdb$family)
+hervdb$family <- gsub("; tr", "", hervdb$family)
+colnames(hervdb)[1] <- "idx"
+hervdb$family <- gsub("Clade \\w+,.*", "complex_mosaic", hervdb$family)
+hervdb$family <- gsub(".*\\|.*", "unresolved_mosaic", hervdb$family)
+
+herve <- hervdb %>% filter(family == "HERV-E")
+
+cpm <- cpm(counts)
+hoi <- herve$idx
+sub_cpm <- filter(as.data.frame(cpm), row.names(cpm) %in% hoi) %>% filter(rowSums(.) > 10)
+
+ann_colors <- list(condition = c(Primary_Tumor = "cyan1", Solid_Tissue_Normal = "coral1"))
+mat_breaks <- c(0, 1, 5, 10, 15, 20)
+
+main <- "TCGA-KIRC: HERVs of interest"
+
+pheatmap(sub_cpm,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         clustering_method = "mcquitty",
+         clustering_distance_rows = "euclidean",
+         breaks = mat_breaks,
+         color = inferno(length(mat_breaks) - 1),
+         main = main,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         clustering_distance_cols = "euclidean",
+         annotation = annotation,
+         annotation_colors = ann_colors,
+         border_color = NA,
+         legend = TRUE, annotation_legend = FALSE)
+```
+
+```{r which families do the DE HERVs that are up in normal belong to?}
+hervdb <- read.table("data/annotations/hervs_8k.gtf", sep = "\t") %>%
+  mutate(family = str_extract(V9, "gene_id .*; tr")) %>%
+  dplyr::select(V2, family)
+
+hervdb$family <- gsub("gene_id RBRT\\d+-", "", hervdb$family)
+hervdb$family <- gsub("; tr", "", hervdb$family)
+colnames(hervdb)[1] <- "idx"
+hervdb$family <- gsub("Clade \\w+,.*", "complex_mosaic", hervdb$family)
+hervdb$family <- gsub(".*\\|.*", "unresolved_mosaic", hervdb$family)
+
+up_norm <- all_res %>%
+  filter(log2FoldChange >= 1 & padj < 0.05) %>%
+  mutate(idx = str_extract(row.names(.), "RBRT\\d+"))
+
+up_norm <- left_join(up_norm, hervdb) %>% group_by(family) %>% summarize(n = n()) %>% arrange(desc(n))
+
+up_tumor <- all_res %>%
+  filter(log2FoldChange <= -1 & padj < 0.05) %>%
+  mutate(idx = str_extract(row.names(.), "RBRT\\d+"))
+
+up_tumor <- left_join(up_tumor, hervdb) %>% group_by(family) %>% summarize(n = n()) %>% arrange(desc(n))
+```
+
+### Stratifying by clinical covariates
+1) Stage
+2) Age
+
+```{r load clin data}
+counts <- read.csv("data/counts_merged.csv", row.names = 1)
+colnames(counts) <- gsub("\\.", "-", colnames(counts))
+
+tumors <- samples %>% filter(samples == "Primary_Tumor")
+counts_tumor <- counts %>% dplyr::select(which(colnames(counts) %in% tumors$sample_id))
+
+clindata <- read.csv("data/clinical/tcga_kirc_clinical_metadata.csv")
+length(unique(samples$case_id))
+
+meta <- merge(tumors, clindata, by = "case_id")
+
+sampleTable <- data.frame(
+  condition = factor(meta$samples),
+  ptid = factor(meta$abv_id),
+  stage = factor(meta$ajcc_pathologic_stage)
+)
+
+table(sampleTable$stage)
+table(meta$age_at_index)
+table(meta$gender)
+table(meta$race)
+
+rownames(sampleTable) <- meta$sample_id
+sampleTable <- sampleTable[match(colnames(counts_tumor), row.names(sampleTable)), ]
+
+sampleTable <- na.omit(sampleTable)
+counts_tumor <- counts_tumor %>% dplyr::select(which(colnames(counts_tumor) %in% row.names(sampleTable)))
+
+#write.csv(sampleTable, "output/tcga_stage_metadata.csv", quote = F)
+
+dds <- DESeqDataSetFromMatrix(counts_tumor,
+                                colData = sampleTable,
+                                design = ~ stage)
+
+dds <- DESeq(dds)
+```
+
+```{r stratifying by clinical covariates - Stage I v Stage II}
+res_stg_IvII <- results(dds, contrast = c("stage", "Stage I", "Stage II"))
+summary(res_stg_IvII)
+res_stg_IvII <- res_stg_IvII[complete.cases(res_stg_IvII), ]
+result_stg_IvII <- res_stg_IvII[order(res_stg_IvII$padj), ]
+
+stg_IvIIDEG <- data.frame(result_stg_IvII[which(abs(result_stg_IvII$log2FoldChange) > 2 & result_stg_IvII$padj < 0.05), ])
+row.names(stg_IvIIDEG) <- gsub("::.*", "", row.names(stg_IvIIDEG))
+stg_IvIIDEG <- stg_IvIIDEG %>%
+  filter(str_detect(rownames(stg_IvIIDEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(stg_IvIIDEG)
+```
+
+```{r stratifying by clinical covariates - Stage I vs Stage III}
+res_stg_IvIII <- results(dds, contrast = c("stage", "Stage I", "Stage III"))
+summary(res_stg_IvIII)
+res_stg_IvIII <- res_stg_IvIII[complete.cases(res_stg_IvIII), ]
+result_stg_IvIII <- res_stg_IvIII[order(res_stg_IvIII$padj), ]
+
+stg_IvIIIDEG <- data.frame(result_stg_IvIII[which(abs(result_stg_IvIII$log2FoldChange) > 2 & result_stg_IvIII$padj < 0.05), ])
+row.names(stg_IvIIIDEG) <- gsub("::.*", "", row.names(stg_IvIIIDEG))
+stg_IvIIIDEG <- stg_IvIIIDEG %>%
+  filter(str_detect(rownames(stg_IvIIIDEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(stg_IvIIIDEG)
+```
+
+```{r stratifying by clinical covariates - Stage I vs Stage IV}
+res_stg_IvIV <- results(dds, contrast = c("stage", "Stage I", "Stage IV"))
+summary(res_stg_IvIV)
+res_stg_IvIV <- res_stg_IvIV[complete.cases(res_stg_IvIV), ]
+result_stg_IvIV <- res_stg_IvIV[order(res_stg_IvIV$padj), ]
+
+stg_IvIVDEG <- data.frame(result_stg_IvIV[which(abs(result_stg_IvIV$log2FoldChange) > 2 & result_stg_IvIV$padj < 0.05), ])
+row.names(stg_IvIVDEG) <- gsub("::.*", "", row.names(stg_IvIVDEG))
+stg_IvIVDEG <- stg_IvIVDEG %>%
+  filter(str_detect(rownames(stg_IvIVDEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(stg_IvIVDEG)
+```
+
+```{r stratifying by clinical covariates - Stage II vs Stage III}
+res_stg_IIvIII <- results(dds, contrast = c("stage", "Stage II", "Stage III"))
+summary(res_stg_IIvIII)
+res_stg_IIvIII <- res_stg_IIvIII[complete.cases(res_stg_IIvIII), ]
+result_stg_IIvIII <- res_stg_IIvIII[order(res_stg_IIvIII$padj), ]
+
+stg_IIvIIIDEG <- data.frame(result_stg_IIvIII[which(abs(result_stg_IIvIII$log2FoldChange) > 2 & result_stg_IIvIII$padj < 0.05), ])
+row.names(stg_IIvIIIDEG) <- gsub("::.*", "", row.names(stg_IIvIIIDEG))
+stg_IIvIIIDEG <- stg_IIvIIIDEG %>%
+  filter(str_detect(rownames(stg_IIvIIIDEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(stg_IIvIIIDEG)
+```
+
+```{r stratifying by clinical covariates - Stage II vs Stage IV}
+res_stg_IIvIV <- results(dds, contrast = c("stage", "Stage II", "Stage IV"))
+summary(res_stg_IIvIV)
+res_stg_IIvIV <- res_stg_IIvIV[complete.cases(res_stg_IIvIV), ]
+result_stg_IIvIV <- res_stg_IIvIV[order(res_stg_IIvIV$padj), ]
+
+stg_IIvIVDEG <- data.frame(result_stg_IIvIV[which(abs(result_stg_IIvIV$log2FoldChange) > 2 & result_stg_IIvIV$padj < 0.05), ])
+row.names(stg_IIvIVDEG) <- gsub("::.*", "", row.names(stg_IIvIVDEG))
+stg_IIvIVDEG <- stg_IIvIVDEG %>%
+  filter(str_detect(rownames(stg_IIvIVDEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(stg_IIvIVDEG)
+```
+
+```{r stratifying by clinical covariates - Stage III vs Stage IV}
+res_stg_IIIvIV <- results(dds, contrast = c("stage", "Stage III", "Stage IV"))
+summary(res_stg_IIIvIV)
+res_stg_IIIvIV <- res_stg_IIIvIV[complete.cases(res_stg_IIIvIV), ]
+result_stg_IIIvIV <- res_stg_IIIvIV[order(res_stg_IIIvIV$padj), ]
+
+stg_IIIvIVDEG <- data.frame(result_stg_IIIvIV[which(abs(result_stg_IIIvIV$log2FoldChange) > 2 & result_stg_IIIvIV$padj < 0.05), ])
+row.names(stg_IIIvIVDEG) <- gsub("::.*", "", row.names(stg_IIIvIVDEG))
+stg_IIIvIVDEG <- stg_IIIvIVDEG %>%
+  filter(str_detect(rownames(stg_IIIvIVDEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(stg_IIIvIVDEG)
+```
+
+```{r combine all stage specific hervs and plot}
+stage_hervs <- c(stg_IvIIDEG$IDm, stg_IvIIIDEG$IDm, stg_IvIVDEG$IDm,
+                  stg_IIvIIIDEG$IDm, stg_IIvIVDEG$IDm, stg_IIIvIVDEG$IDm) %>% unique()
+
+cpm_tumor <- cpm(counts_tumor)
+cpm_tumor <- as.data.frame(cpm_tumor) %>% filter(row.names(.) %in% stage_hervs)
+cpm_tumor <- t(cpm_tumor)
+
+cpm_tumor <- merge(cpm_tumor, sampleTable, by = "row.names")
+row.names(cpm_tumor) <- cpm_tumor$Row.names
+cpm_tumor <- cpm_tumor[, -1]
+
+cpm_tumor <- pivot_longer(cpm_tumor, cols = where(is.numeric))
+
+summary_df <- cpm_tumor |>
+  group_by(stage, name) |>
+  summarise(mean_expr = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(summary_df, aes(x = stage, y = mean_expr, group = name, color = name)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(x = "Stage", y = "Mean Expression", color = "Element") +
+  ggtitle("DE HERVs between stages")
+
+#ggsave(filename = "output/tcga_de_stage_hervs.pdf", width = 11, height = 8)
+
+# color by family instead of individual locus
+colnames(hervdb)[1] <- "name"
+summary_df <- left_join(summary_df, hervdb)
+summary_df$family <- gsub("Clade I.*", "Clade I", summary_df$family)
+
+ggplot(summary_df, aes(x = stage, y = mean_expr, group = family, color = family)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(x = "Stage", y = "Mean Expression", color = "Element") +
+  ggtitle("DE HERVs between stages")
+
+#ggsave(filename = "output/tcga_de_stage_hervs_fam.pdf", width = 11, height = 8)
+```
+
+# by age
+
+```{r age}
+counts <- read.csv("data/counts_merged.csv", row.names = 1)
+colnames(counts) <- gsub("\\.", "-", colnames(counts))
+
+tumors <- samples %>% filter(samples == "Primary_Tumor")
+counts_tumor <- counts %>% dplyr::select(which(colnames(counts) %in% tumors$sample_id))
+
+clindata <- read.csv("data/clinical/tcga_kirc_clinical_metadata.csv")
+meta <- merge(tumors, clindata, by = "case_id")
+
+sampleTable <- data.frame(
+  condition = factor(meta$samples),
+  ptid = factor(meta$abv_id),
+  age = as.numeric(meta$age_at_index)
+)
+
+sampleTable <- sampleTable |>
+  mutate(age_group = cut(age,
+                         breaks = c(26, 40, 55, 70, 90),
+                         labels = c("26-40", "41-55", "56-70", "71-90"),
+                         include.lowest = TRUE))
+
+rownames(sampleTable) <- meta$sample_id
+sampleTable <- sampleTable[match(colnames(counts_tumor), row.names(sampleTable)), ]
+
+sampleTable <- na.omit(sampleTable)
+counts_tumor <- counts_tumor %>% dplyr::select(which(colnames(counts_tumor) %in% row.names(sampleTable)))
+
+#write.csv(sampleTable, "output/tcga_age_metadata.csv", quote = F)
+
+dds <- DESeqDataSetFromMatrix(counts_tumor,
+                                colData = sampleTable,
+                                design = ~ age_group)
+
+dds <- DESeq(dds)
+```
+
+```{r stratifying by clinical covariates - age groups 26-40 vs 41-55}
+res_age_1v2 <- results(dds, contrast = c("age_group", "26-40", "41-55"))
+summary(res_age_1v2)
+res_age_1v2 <- res_age_1v2[complete.cases(res_age_1v2), ]
+result_age_1v2 <- res_age_1v2[order(res_age_1v2$padj), ]
+
+age_1v2DEG <- data.frame(result_age_1v2[which(abs(result_age_1v2$log2FoldChange) > 1 & result_age_1v2$padj < 0.05), ])
+row.names(age_1v2DEG) <- gsub("::.*", "", row.names(age_1v2DEG))
+age_1v2DEG <- age_1v2DEG %>%
+  filter(str_detect(rownames(age_1v2DEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(age_1v2DEG)
+```
+
+```{r stratifying by clinical covariates - age groups 26-40 vs 56-70}
+res_age_1v3 <- results(dds, contrast = c("age_group", "26-40", "56-70"))
+summary(res_age_1v3)
+res_age_1v3 <- res_age_1v3[complete.cases(res_age_1v3), ]
+result_age_1v3 <- res_age_1v3[order(res_age_1v3$padj), ]
+
+age_1v3DEG <- data.frame(result_age_1v3[which(abs(result_age_1v3$log2FoldChange) > 1 & result_age_1v3$padj < 0.05), ])
+row.names(age_1v3DEG) <- gsub("::.*", "", row.names(age_1v3DEG))
+age_1v3DEG <- age_1v3DEG %>%
+  filter(str_detect(rownames(age_1v3DEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(age_1v3DEG)
+```
+
+```{r stratifying by clinical covariates - age groups 26-40 vs 71-90}
+res_age_1v4 <- results(dds, contrast = c("age_group", "26-40", "71-90"))
+summary(res_age_1v4)
+res_age_1v4 <- res_age_1v4[complete.cases(res_age_1v4), ]
+result_age_1v4 <- res_age_1v4[order(res_age_1v4$padj), ]
+
+age_1v4DEG <- data.frame(result_age_1v4[which(abs(result_age_1v4$log2FoldChange) > 1 & result_age_1v4$padj < 0.05), ])
+row.names(age_1v4DEG) <- gsub("::.*", "", row.names(age_1v4DEG))
+age_1v4DEG <- age_1v4DEG %>%
+  filter(str_detect(rownames(age_1v4DEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(age_1v4DEG)
+```
+
+```{r stratifying by clinical covariates - age groups 41-55 vs 56-70}
+res_age_2v3 <- results(dds, contrast = c("age_group", "41-55", "56-70"))
+summary(res_age_2v3)
+res_age_2v3 <- res_age_2v3[complete.cases(res_age_2v3), ]
+result_age_2v3 <- res_age_2v3[order(res_age_2v3$padj), ]
+
+age_2v3DEG <- data.frame(result_age_2v3[which(abs(result_age_2v3$log2FoldChange) > 1 & result_age_2v3$padj < 0.05), ])
+row.names(age_2v3DEG) <- gsub("::.*", "", row.names(age_2v3DEG))
+age_2v3DEG <- age_2v3DEG %>%
+  filter(str_detect(rownames(age_2v3DEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(age_2v3DEG)
+```
+
+```{r stratifying by clinical covariates - age groups 41-55 vs 71-90}
+res_age_2v4 <- results(dds, contrast = c("age_group", "41-55", "71-90"))
+summary(res_age_2v4)
+res_age_2v4 <- res_age_2v4[complete.cases(res_age_2v4), ]
+result_age_2v4 <- res_age_2v4[order(res_age_2v4$padj), ]
+
+age_2v4DEG <- data.frame(result_age_2v4[which(abs(result_age_2v4$log2FoldChange) > 1 & result_age_2v4$padj < 0.05), ])
+row.names(age_2v4DEG) <- gsub("::.*", "", row.names(age_2v4DEG))
+age_2v4DEG <- age_2v4DEG %>%
+  filter(str_detect(rownames(age_2v4DEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(age_2v4DEG)
+```
+
+```{r stratifying by clinical covariates - age groups 56-70 vs 71-90}
+res_age_3v4 <- results(dds, contrast = c("age_group", "56-70", "71-90"))
+summary(res_age_3v4)
+res_age_3v4 <- res_age_3v4[complete.cases(res_age_3v4), ]
+result_age_3v4 <- res_age_3v4[order(res_age_3v4$padj), ]
+
+age_3v4DEG <- data.frame(result_age_3v4[which(abs(result_age_3v4$log2FoldChange) > 1 & result_age_3v4$padj < 0.05), ])
+row.names(age_3v4DEG) <- gsub("::.*", "", row.names(age_3v4DEG))
+age_3v4DEG <- age_3v4DEG %>%
+  filter(str_detect(rownames(age_3v4DEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(age_3v4DEG)
+```
+
+```{r combine all age specific hervs and plot}
+age_hervs <- c(age_1v2DEG$IDm, age_1v3DEG$IDm, age_1v4DEG$IDm,
+                age_2v3DEG$IDm, age_2v4DEG$IDm, age_3v4DEG$IDm) %>% unique()
+
+cpm_tumor <- cpm(counts_tumor)
+cpm_tumor <- as.data.frame(cpm_tumor) %>% filter(row.names(.) %in% age_hervs)
+cpm_tumor <- t(cpm_tumor)
+
+cpm_tumor <- merge(cpm_tumor, sampleTable, by = "row.names")
+row.names(cpm_tumor) <- cpm_tumor$Row.names
+cpm_tumor <- cpm_tumor %>% select(-c(Row.names, age))
+
+cpm_tumor <- pivot_longer(cpm_tumor, cols = where(is.numeric))
+
+summary_df <- cpm_tumor |>
+  group_by(age_group, name) |>
+  summarise(mean_expr = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(summary_df, aes(x = age_group, y = mean_expr, group = name, color = name)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(x = "Stage", y = "Mean Expression", color = "Element") +
+  ggtitle("DE HERVs between age groups")
+
+#ggsave(filename = "output/tcga_de_age_hervs.pdf", width = 11, height = 8)
+
+colnames(hervdb)[1] <- "name"
+summary_df <- left_join(summary_df, hervdb)
+summary_df$family <- gsub("Clade I.*", "Clade I", summary_df$family)
+
+ggplot(summary_df, aes(x = age_group, y = mean_expr, group = family, color = family)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(x = "age", y = "Mean Expression", color = "Element") +
+  ggtitle("DE HERVs between age groups")
+
+#ggsave(filename = "output/tcga_de_age_hervs_fam.pdf", width = 11, height = 8)
+```
+
+# by gender
+```{r gender}
+counts <- read.csv("data/counts_merged.csv", row.names = 1)
+colnames(counts) <- gsub("\\.", "-", colnames(counts))
+
+tumors <- samples %>% filter(samples == "Primary_Tumor")
+counts_tumor <- counts %>% dplyr::select(which(colnames(counts) %in% tumors$sample_id))
+
+clindata <- read.csv("data/clinical/tcga_kirc_clinical_metadata.csv")
+meta <- merge(tumors, clindata, by = "case_id")
+
+sampleTable <- data.frame(
+  condition = factor(meta$samples),
+  ptid = factor(meta$abv_id),
+  gender = factor(meta$gender)
+)
+
+table(meta$age_at_index)
+table(meta$gender)
+table(meta$race)
+
+rownames(sampleTable) <- meta$sample_id
+sampleTable <- sampleTable[match(colnames(counts_tumor), row.names(sampleTable)), ]
+
+sampleTable <- na.omit(sampleTable)
+counts_tumor <- counts_tumor %>% dplyr::select(which(colnames(counts_tumor) %in% row.names(sampleTable)))
+
+#write.csv(sampleTable, "output/tcga_gender_metadata.csv", quote = F)
+
+dds <- DESeqDataSetFromMatrix(counts_tumor,
+                                colData = sampleTable,
+                                design = ~ gender)
+
+dds <- DESeq(dds)
+```
+
+```{r stratifying by clinical covariates - gender}
+res_gender <- results(dds, contrast = c("gender", "female", "male"))
+summary(res_gender)
+res_gender <- res_gender[complete.cases(res_gender), ]
+result_gender <- res_gender[order(res_gender$padj), ]
+
+genderDEG <- data.frame(result_gender[which(abs(result_gender$log2FoldChange) > 1 & result_gender$padj < 0.05), ])
+row.names(genderDEG) <- gsub("::.*", "", row.names(genderDEG))
+genderDEG <- genderDEG %>%
+  filter(str_detect(rownames(genderDEG), "RBRT")) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(IDm = row.names(.)) %>%
+  mutate(stg = "Stage III")
+nrow(genderDEG)
+```
+
+```{r combine all gender specific hervs and plot}
+cpm_tumor <- cpm(counts_tumor)
+cpm_tumor <- as.data.frame(cpm_tumor) %>% filter(row.names(.) %in% genderDEG$IDm)
+cpm_tumor <- t(cpm_tumor)
+
+cpm_tumor <- merge(cpm_tumor, sampleTable, by = "row.names")
+row.names(cpm_tumor) <- cpm_tumor$Row.names
+
+cpm_tumor <- pivot_longer(cpm_tumor, cols = where(is.numeric))
+
+summary_df <- cpm_tumor |>
+  group_by(gender, name) |>
+  summarise(mean_expr = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(summary_df, aes(x = gender, y = mean_expr, group = name, color = name)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(x = "Stage", y = "Mean Expression", color = "Element") +
+  ggtitle("DE HERVs between gender")
+
+#ggsave(filename = "output/tcga_de_gender_hervs.pdf", width = 11, height = 8)
+
+colnames(hervdb)[1] <- "name"
+summary_df <- left_join(summary_df, hervdb)
+summary_df$family <- gsub("Clade I.*", "Clade I", summary_df$family)
+
+ggplot(summary_df, aes(x = gender, y = mean_expr, group = name, color = family)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(x = "gender", y = "Mean Expression", color = "Element") +
+  ggtitle("DE HERVs between gender (zoom)") +
+  coord_cartesian(ylim = c(0, 10))
+
+#ggsave(filename = "output/tcga_de_gender_hervs_fam_zoom.pdf", width = 11, height = 8)
+```
+
+```{r venn diagram of DE HERVs -- patients and TCGA}
+de_pts <- read.csv("data/results/patients_deh_results.csv") %>% filter(log2FoldChange <= -1)
+de_tcga <- read.csv("data/results/tcga_kirc_deh.csv") %>% filter(log2FoldChange <= -1)
+
+DE_HERVs <- list(patients = de_pts$idx,
+                  TCGA = de_tcga$idx)
+
+ggVennDiagram(DE_HERVs) +
+  scale_fill_gradient(low = "white", high = "red") +
+  coord_flip() +
+  ggtitle("Differentially expressed HERV loci (LFC > 1)")
+
+#ggsave("output/patients_tcga_venn.pdf", width = 8, height = 6)
+```
+
+```{r DE HERV family distribution normalized}
+hervdb <- read.table("data/annotations/hervs_8k.gtf", sep = "\t") %>%
+  mutate(family = str_extract(V9, "gene_id .*; tr")) %>%
+  dplyr::select(V2, family)
+
+hervdb$family <- gsub("gene_id RBRT\\d+-", "", hervdb$family)
+hervdb$family <- gsub("; tr", "", hervdb$family)
+colnames(hervdb)[1] <- "idx"
+hervdb$family <- gsub("Clade \\w+,.*", "complex_mosaic", hervdb$family)
+hervdb$family <- gsub(".*\\|.*", "unresolved_mosaic", hervdb$family)
+
+all_de <- c(de_pts$idx, de_tcga$idx) %>% unique()
+all_de <- hervdb %>% filter(idx %in% all_de) %>% group_by(family) %>% summarize(n = n())
+
+family_norm <- hervdb %>% group_by(family) %>% summarize(n_fam = n())
+
+all_de <- left_join(all_de, family_norm, by = "family") %>%
+  mutate(norm = n / n_fam * 100) %>%
+  arrange(desc(norm))
+
+library(PNWColors)
+pal <- pnw_palette("Starfish", 45)
+
+ggplot(all_de, aes(x = reorder(str_trunc(family, 25), desc(norm)), y = norm, fill = family)) +
+  geom_bar(position = "stack", stat = "identity") +
+  theme_classic() +
+  xlab("family") +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45), legend.position = "none") +
+  ggtitle("DE HERV families") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = pal)
+
+#ggsave("output/de_hervs_by_fam_norm.pdf", width = 8, height = 6)
+
+# shared DE loci only
+shared_de <- de_pts$idx[which(de_pts$idx %in% de_tcga$idx)] %>% unique()
+shared_de <- hervdb %>% filter(idx %in% shared_de) %>% group_by(family) %>% summarize(n = n())
+
+family_norm <- hervdb %>% group_by(family) %>% summarize(n_fam = n())
+shared_de <- left_join(shared_de, family_norm, by = "family") %>%
+  mutate(norm = n / n_fam * 100) %>%
+  arrange(desc(norm))
+
+pal <- pnw_palette("Starfish", 9)
+shared_de$family[7] <- "other"
+
+ggplot(shared_de, aes(x = reorder(str_trunc(family, 25), desc(norm)), y = norm, fill = family)) +
+  geom_bar(position = "stack", stat = "identity", col = "black") +
+  theme_classic() +
+  xlab("family") +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45, size = 15), legend.position = "none") +
+  ggtitle("Shared DE HERV families (TCGA + patient cohort)") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = pal)
+
+#ggsave("output/sharedde_hervs_by_fam_norm.pdf", width = 8, height = 8)
+
+```
+
+```{r which HERV hits are in retrotector}
+de_pts <- read.csv("data/results/patients_deh_results.csv")
+de_tcga <- read.csv("data/results/tcga_kirc_deh.csv")
+
+all_de <- rbind(de_pts, de_tcga) %>% group_by(idx) %>% summarize(lfc = -1 * mean(log2FoldChange, na.rm = TRUE))
+shared_de <- de_pts$idx[which(de_pts$idx %in% de_tcga$idx)] %>% unique()
+
+hervdb_annot <- read.table("data/annotations/hervs_nsltr_8k.tsv", sep = "\t", header = TRUE)
+hervdb_annot <- hervdb_annot %>% mutate(annotation = str_extract(idxRBT, "T")) %>% select(idx, annotation)
+hervdb_annot$annotation[which(is.na(hervdb_annot$annotation))] <- "HERVdb"
+hervdb_annot$annotation <- gsub("T", "HERVdb + retrotector", hervdb_annot$annotation)
+
+all_de <- left_join(all_de, hervdb_annot)
+all_de$lfc <- round(all_de$lfc)
+
+pal <- pnw_palette("Starfish", 4)
+ggplot(all_de, aes(x = factor(lfc), fill = annotation)) +
+  geom_bar(position = "stack", stat = "count", color = "black") +
+  theme_classic() +
+  xlab("log2FC") +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45)) +
+  ggtitle("DE HERVs from each annotation") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = pal)
+
+#ggsave("output/de_hervs_from_annot.pdf", width = 6, height = 6)
+
+shared_de <- all_de %>% filter(idx %in% shared_de)
+ggplot(shared_de, aes(x = factor(lfc), fill = retrotector)) +
+  geom_bar(position = "stack", stat = "count", color = "black") +
+  theme_classic() +
+  xlab("log2FC") +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45)) +
+  ggtitle("DE HERVs from each annotation") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = pal)
+
+#ggsave("output/de_hervs_from_annot_shared.pdf", width = 6, height = 8)
+
+pal <- pnw_palette("Starfish", 50)
+all_de_fam <- left_join(all_de, hervdb) %>% group_by(retrotector)
+ggplot(all_de_fam, aes(x = factor(lfc), fill = family)) +
+  geom_bar(position = "stack", stat = "count", color = "black") +
+  theme_classic() +
+  xlab("log2FC") +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45)) +
+  ggtitle("DE HERVs from each annotation") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = pal)
+
+#ggsave("output/de_hervs_from_annot_fam.pdf", width = 6, height = 8)
+```
+
+```{r DE HERVs across chromosomes}
+all_de_chr <- left_join(all_de, hervdb_annot) %>% select(idx, chrom) %>% group_by(chrom) %>% summarize(n = n())
+
+chr_order <- c(paste0("chr", 1:22), "chrX", "chrY")
+all_de_chr$chrom <- factor(all_de_chr$chrom, levels = chr_order)
+
+library(PNWColors)
+pal <- pnw_palette("Sailboat", 25)
+
+ggplot(all_de_chr, aes(x = chrom, y = n, fill = chrom)) +
+  geom_bar(position = "stack", stat = "identity") +
+  theme_classic() +
+  xlab("family") +
+  scale_fill_manual(values = pal) +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45), legend.position = "none") +
+  ggtitle("DE HERV distribution across genome (not normalized)") +
+  scale_y_continuous(expand = c(0, 0))
+
+#ggsave("output/de_herv_chrm_distribution.pdf", width = 6, height = 6)
+
+hervdb_annot_norm <- hervdb_annot %>% group_by(chrom) %>% summarize(total = n())
+all_de_chr <- left_join(all_de_chr, hervdb_annot_norm) %>% mutate(norm = n / total)
+all_de_chr$chrom <- factor(all_de_chr$chrom, levels = chr_order)
+
+pal <- pnw_palette("Sailboat", 25)
+ggplot(all_de_chr, aes(x = chrom, y = norm, fill = chrom)) +
+  geom_bar(position = "stack", stat = "identity") +
+  theme_classic() +
+  xlab("") +
+  scale_fill_manual(values = pal) +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45), legend.position = "none") +
+  ggtitle("DE HERV distribution across genome (normalized)") +
+  scale_y_continuous(expand = c(0, 0))
+
+#ggsave("output/de_herv_chrm_distribution_norm.pdf", width = 8, height = 6)
+```
+
+```{r for shared DE HERVs, what viral genes}
+de_gtf <- read.table("data/annotations/hervs_8k_v13.gtf", sep = "\t") %>%
+  mutate(idx = str_extract(V9, "RBRT\\d+"))
+
+de_gtf <- de_gtf %>% filter(idx %in% shared_de) %>% dplyr::select(-idx)
+
+#write.table(de_gtf, "output/de_herv.gtf", sep = "\t", row.names = F, quote = F)
+
+# intersect results, filtering out gene/transcript-level entries
+int <- read.table("data/annotations/de_herv_intersect_genes.bed", sep = "\t") %>%
+  mutate(idx = str_extract(V9, "RBRT\\d+")) %>%
+  filter(V11 != "HERVdb")
+
+genes <- c("gag", "pro", "pol", "env", "ltr", "rt", "tm", "su", "ltr\\d+")
+pattern <- paste0("\\b(", paste(genes, collapse = "|"), ")\\b")
+
+viral <- int |>
+  mutate(gene_name = toupper(str_extract(V18, regex(pattern, ignore_case = TRUE))))
+viral$gene_name <- gsub("LTR\\d+", "LTR", viral$gene_name)
+
+viral_sum <- viral %>% group_by(gene_name) %>% summarize(n = n()) %>% arrange(desc(n))
+
+library(PNWColors)
+pal <- pnw_palette("Sailboat", 10)
+
+ggplot(viral_sum, aes(x = "", y = n, fill = gene_name)) +
+  geom_bar(stat = "identity", width = 0.5, color = "black") +
+  geom_text(aes(label = paste0(gene_name, ": ", n)),
+            position = position_stack(vjust = 0.5),
+            size = 3.5, color = "black", fontface = "bold") +
+  scale_fill_manual(values = pal) +
+  labs(title = "viral genes of shared DE HERVs",
+       x = NULL, y = "count", fill = "gene") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+#ggsave("output/shared_de_herv_viral_genes.pdf", height = 8, width = 6)
+```

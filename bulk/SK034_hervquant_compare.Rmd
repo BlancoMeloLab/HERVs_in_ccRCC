@@ -1,0 +1,528 @@
+---
+title: "HERVQUANT comparison"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+https://www.jci.org/articles/view/121476#sd 
+hervQuant expression matrices for TCGA pan-cancer (UQN and RPM) and aPD1-treated ccRCC (raw reads) RNA-Seq datasets are available in Supplemental Tables 12-14.
+Table 12 = log2(RPM) -- HERV counts normalized to each sample's total sequencing depth
+Table 13 = log2(UQN) -- HERV counts normalized to the 75th percentile of that sample's distribution
+
+```{r}
+library(DESeq2) 
+library(RColorBrewer)
+library(pheatmap)
+library(viridis)
+library(ggplot2)
+library(tximport)
+library(edgeR)
+#library(EnhancedVolcano)
+library(patchwork)
+library(tidyverse)
+library(reshape2)
+library(data.table)
+library(stringr)
+library(readxl)
+library(ggVennDiagram)
+library(readr)
+library(clusterProfiler)
+library(biomaRt)
+library(MetBrewer)
+library(ggpubr)
+library(rstatix)
+library(dplyr)
+select <- dplyr::select
+```
+
+```{r load hervquant and hervdb RPM matrices}
+# hervQuant Table 12: log2(RPM) HERV expression matrix
+hervquant <- read.table("data/hervquant_supplemental_table12.txt", sep = "\t", header = TRUE)
+hervquant$Sample_ID <- gsub("_", "-", hervquant$Sample_ID)
+
+hervquant <- hervquant %>% t()
+colnames(hervquant) <- hervquant[1, ]
+hervquant <- hervquant[-1, ]
+hervquant_mat <- apply(hervquant, 2, as.numeric)
+rownames(hervquant_mat) <- rownames(hervquant)
+
+# Precomputed HERVdb (Telescope) RPM matrix -- already normalized to each
+# sample's total sequencing depth (genes + HERVs combined)
+rpm_matrix <- read.csv("data/hervdb_tcga_rpm_matrix.csv", row.names = 1)
+
+# HERV ID conversion table (hervdb <-> hervquant)
+convert <- read.table("data/annotations/hervdb_v13_convert.bed", sep = "\t") %>% dplyr::select(V4, V8)
+colnames(convert) <- c("hervquant", "hervdb")
+
+# restrict both matrices to the samples they share, in matching column order
+shared_samples <- intersect(colnames(hervquant_mat), colnames(rpm_matrix))
+hervquant_mat <- hervquant_mat[, shared_samples]
+rpm_matrix <- rpm_matrix[, shared_samples]
+
+identical(colnames(hervquant_mat), colnames(rpm_matrix))  # sanity check -- should be TRUE
+```
+
+```{r pseudocount}
+# log2(RPM+1), matching hervQuant's Table 12 convention (confirmed empirically: pseudocount = 1)
+log2_rpm_matrix <- log2(rpm_matrix + 1)
+
+# should now have NO negative values at all, since log2(x+1) >= 0 for x >= 0
+range(log2_rpm_matrix)
+sum(log2_rpm_matrix < 0)   # should be 0
+
+convert_matched <- convert %>%
+  filter(hervdb %in% rownames(log2_rpm_matrix))
+
+message(nrow(convert_matched), " of ", nrow(convert), " conversion entries found in log2_rpm_mat")
+message(length(unique(convert_matched$hervquant)), " unique hervQuant loci represented")
+
+log2_rpm_herv <- log2_rpm_matrix[convert_matched$hervdb, , drop = FALSE]
+
+aggregated_by_hervquant <- convert_matched %>%
+  select(hervdb, hervquant) %>%
+  left_join(
+    log2_rpm_herv %>% as.data.frame() %>% rownames_to_column("hervdb"),
+    by = "hervdb"
+  ) %>%
+  select(-hervdb) %>%
+  pivot_longer(-hervquant, names_to = "sample_id", values_to = "log2_rpm_plus1") %>%
+  group_by(hervquant, sample_id) %>%
+  summarise(
+    # un-pseudocount each sub-locus back to linear RPM, sum in linear space,
+    # then re-apply the pseudocount ONCE to the summed total -- not per sub-locus
+    rpm_summed = sum(2^log2_rpm_plus1 - 1),
+    log2_rpm_summed = log2(rpm_summed + 1),
+    n_loci = n(),
+    .groups = "drop"
+  )
+
+hervdb_long <- aggregated_by_hervquant %>%
+  select(hervquant, sample_id, hervdb_log2rpm = log2_rpm_summed)
+
+hervquant_long <- hervquant_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("hervquant") %>%
+  pivot_longer(-hervquant, names_to = "sample_id", values_to = "hervquant_log2rpm")
+
+concordance_data <- hervdb_long %>%
+  inner_join(hervquant_long, by = c("hervquant", "sample_id"))
+
+message(nrow(concordance_data), " matched hervquant-locus x sample observations")
+message(length(unique(concordance_data$hervquant)), " unique loci in the comparison")
+
+locus_summary <- concordance_data %>%
+  group_by(hervquant) %>%
+  summarise(
+    mean_hervdb = mean(hervdb_log2rpm),
+    mean_hervquant = mean(hervquant_log2rpm),
+    .groups = "drop"
+  )
+
+cor_result <- cor.test(locus_summary$mean_hervdb, locus_summary$mean_hervquant, method = "spearman")
+cor_result
+
+p_concordance <- ggplot(locus_summary, aes(x = mean_hervquant, y = mean_hervdb)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick") +
+  labs(
+    title = "Concordance of shared HERV loci between databases",
+    subtitle = paste0("Spearman rho = ", round(cor_result$estimate, 3),
+                       ", p = ", format.pval(cor_result$p.value, digits = 2)),
+    x = "hervQuant mean log2(RPM+1)",
+    y = "HERV-db mean log2(RPM+1)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+
+print(p_concordance)
+#ggsave("output/concordance_plot_pseudocount.pdf", height = 6, width = 8)
+
+#### violin
+vln_long <- rbind(hervdb_long, hervquant_long)
+ggplot(vln_long, aes(x = dataset, y = log2rpm)) + geom_violin() +
+  geom_point(alpha = 0.5, size = 1.5) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+#ggsave("output/violin_plot_pseudocount.pdf", height = 6, width = 8)
+```
+
+```{r concordance plot with hervdb exclusive loci}
+log2_rpm_matrix <- log2(rpm_matrix + 1)
+
+convert_matched <- convert %>%
+  filter(hervdb %in% rownames(log2_rpm_matrix))
+
+log2_rpm_herv <- log2_rpm_matrix[convert_matched$hervdb, , drop = FALSE]
+
+aggregated_by_hervquant <- convert_matched %>%
+  select(hervdb, hervquant) %>%
+  left_join(
+    log2_rpm_herv %>% as.data.frame() %>% rownames_to_column("hervdb"),
+    by = "hervdb"
+  ) %>%
+  select(-hervdb) %>%
+  pivot_longer(-hervquant, names_to = "sample_id", values_to = "log2_rpm_plus1") %>%
+  group_by(hervquant, sample_id) %>%
+  summarise(
+    rpm_summed = sum(2^log2_rpm_plus1 - 1),
+    log2_rpm_summed = log2(rpm_summed + 1),
+    n_loci = n(),
+    .groups = "drop"
+  )
+
+hervdb_long <- aggregated_by_hervquant %>%
+  select(hervquant, sample_id, hervdb_log2rpm = log2_rpm_summed)
+
+hervquant_long <- hervquant_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("hervquant") %>%
+  pivot_longer(-hervquant, names_to = "sample_id", values_to = "hervquant_log2rpm")
+
+## ---- Shared loci for correlation ----
+
+shared_ids <- intersect(hervdb_long$hervquant, hervquant_long$hervquant)
+
+concordance_data <- hervdb_long %>%
+  filter(hervquant %in% shared_ids) %>%
+  inner_join(hervquant_long, by = c("hervquant", "sample_id"))
+
+locus_summary <- concordance_data %>%
+  group_by(hervquant) %>%
+  summarise(
+    mean_hervdb = mean(hervdb_log2rpm),
+    mean_hervquant = mean(hervquant_log2rpm),
+    .groups = "drop"
+  ) %>%
+  mutate(source = "shared")
+
+## ---- HERVdb-exclusive loci: raw RBRT IDs never present in `convert` at all ----
+
+all_hervdb_ids <- rownames(log2_rpm_matrix)
+hervdb_only_raw_ids <- setdiff(all_hervdb_ids, convert$hervdb)
+
+message(length(hervdb_only_raw_ids), " HERVdb loci have no crosswalk entry in `convert` at all")
+
+locus_summary_hervdb_only <- log2_rpm_matrix[hervdb_only_raw_ids, , drop = FALSE] %>%
+  as.data.frame() %>%
+  rownames_to_column("hervquant") %>%   # keeping column name "hervquant" for rbind compatibility, even though these are raw RBRT IDs
+  pivot_longer(-hervquant, names_to = "sample_id", values_to = "hervdb_log2rpm") %>%
+  group_by(hervquant) %>%
+  summarise(mean_hervdb = mean(hervdb_log2rpm, na.rm = TRUE), .groups = "drop") %>%
+  mutate(mean_hervquant = 0, source = "hervdb_only")
+
+locus_summary_plot <- bind_rows(locus_summary, locus_summary_hervdb_only)
+
+cor_result <- cor.test(locus_summary$mean_hervdb, locus_summary$mean_hervquant, method = "spearman")
+cor_result
+
+p_concordance <- ggplot(locus_summary_plot, aes(x = mean_hervquant, y = mean_hervdb, color = source)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(data = locus_summary, aes(x = mean_hervquant, y = mean_hervdb),
+              method = "lm", se = TRUE, color = "firebrick", inherit.aes = FALSE) +
+  scale_color_manual(values = c("shared" = "black", "hervdb_only" = "blue"),
+                      labels = c("shared" = "Shared loci", "hervdb_only" = "HERVdb-exclusive"),
+                      name = "") +
+  labs(
+    title = "Concordance of shared HERV loci between databases",
+    subtitle = paste0("Spearman rho = ", round(cor_result$estimate, 3),
+                       " (shared loci only), p = ", format.pval(cor_result$p.value, digits = 2)),
+    x = "hervQuant mean log2(RPM+1)",
+    y = "HERV-db mean log2(RPM+1)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+
+print(p_concordance)
+#ggsave("output/concordance_plot_pseudocount_hervdb_excl.pdf", height = 6, width = 8)
+```
+
+```{r barplots}
+de_pts <- read.csv("data/results/patients_deh_results.csv")
+de_tcga <- read.csv("data/results/tcga_kirc_deh.csv")
+
+all_de <- rbind(de_pts, de_tcga) %>% group_by(idx) %>% summarize(lfc = -1 * mean(log2FoldChange, na.rm = TRUE))
+shared_de <- de_pts$idx[which(de_pts$idx %in% de_tcga$idx)] %>% unique()
+shared_de <- c(shared_de, "RBRT190212")
+
+conversion_sub <- convert %>%
+  filter(hervdb %in% shared_de)
+
+hervdb_long <- log2_rpm_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("hervdb") %>%
+  pivot_longer(-hervdb, names_to = "sample_id", values_to = "log2rpm")
+hervdb_long <- left_join(hervdb_long, convert)
+
+## ---- Reshape both matrices to long format ----
+hervquant_long <- hervquant_long %>% mutate(dataset = "hervquant") %>% rename(log2rpm = hervquant_log2rpm)
+hervdb_long <- hervdb_long %>% mutate(dataset = "hervdb")
+
+hervquant_long <- left_join(hervquant_long, convert)
+
+combined_long <- bind_rows(hervquant_long, hervdb_long)
+combined_long <- combined_long %>% filter(hervdb %in% shared_de)
+
+## ---- Summarize: mean + SE per locus per dataset ----
+
+combined_summary <- combined_long %>%
+  group_by(hervdb, dataset) %>%
+  summarise(
+    mean_value = mean(log2rpm, na.rm = TRUE),
+    se = sd(log2rpm, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  complete(hervdb, dataset, fill = list(mean_value = 0, se = 0))
+
+## ---- Plot ----
+
+ggplot(combined_summary, aes(x = hervdb, y = mean_value, fill = dataset)) +
+  geom_bar(stat = "identity", position = position_dodge(),
+           color = "black", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = mean_value - se, ymax = mean_value + se),
+                position = position_dodge(0.9), width = 0.25) +
+  scale_fill_manual(values = c("hervdb" = "blue", "hervquant" = "black")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "", y = "Normalized expression (log2rpm)", fill = "", title = "hervquant vs Telescope") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom")
+
+#ggsave("output/hervquant_v_telescope_bar_pseudocount.pdf", width = 8, height = 8)
+```
+
+```{r different plotting attempt}
+# rebuild hervquant summary fresh (one row per hervquant locus)
+hervquant_raw_long <- hervquant_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("hervquant") %>%
+  pivot_longer(-hervquant, names_to = "sample_id", values_to = "log2rpm")
+
+hervquant_summary <- hervquant_raw_long %>%
+  group_by(hervquant) %>%
+  summarise(mean_value = mean(log2rpm, na.rm = TRUE),
+            se = sd(log2rpm, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+# rebuild hervdb summary, one row per hervdb locus, restricted to shared_de
+hervdb_raw_long <- log2_rpm_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("hervdb") %>%
+  pivot_longer(-hervdb, names_to = "sample_id", values_to = "log2rpm") %>%
+  filter(hervdb %in% shared_de)
+
+hervdb_summary <- hervdb_raw_long %>%
+  group_by(hervdb) %>%
+  summarise(mean_value = mean(log2rpm, na.rm = TRUE),
+            se = sd(log2rpm, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop") %>%
+  mutate(dataset = "hervdb")
+
+# map each hervdb to its hervquant group (if any), then pull that hervquant's
+# summary value; loci with no match get 0 (and are flagged for reference)
+hervdb_to_hervquant <- convert %>%
+  filter(hervdb %in% shared_de) %>%
+  distinct(hervdb, hervquant)
+
+hervquant_matched <- tibble(hervdb = shared_de) %>%
+  left_join(hervdb_to_hervquant, by = "hervdb") %>%
+  left_join(hervquant_summary, by = "hervquant") %>%
+  mutate(
+    matched_in_hervquant = !is.na(hervquant),
+    mean_value = if_else(is.na(mean_value), 0, mean_value),
+    se = if_else(is.na(se), 0, se),
+    dataset = "hervquant"
+  ) %>%
+  select(hervdb, mean_value, se, dataset, matched_in_hervquant)
+
+# combine and plot, faceting/ordering by hervdb directly (no NA grouping)
+plot_summary <- bind_rows(
+  hervdb_summary %>% mutate(matched_in_hervquant = NA),
+  hervquant_matched
+)
+
+ggplot(plot_summary, aes(x = dataset, y = mean_value, fill = dataset)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = mean_value - se, ymax = mean_value + se), width = 0.25) +
+  facet_wrap(~ hervdb, scales = "free_x", nrow = 2) +
+  scale_fill_manual(values = c("hervdb" = "darkviolet", "hervquant" = "darkgreen")) +
+  labs(x = "", y = "Normalized expression (log2 RPM)", fill = "",
+       title = "HERV-db captures loci absent from or merged in hervQuant") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+
+#ggsave("output/hervquant_v_telescope_bar_facet.pdf", width = 8, height = 8)
+```
+
+```{r back to linear -- run this after loading the RPM matrices}
+### RPM-scale version of the fragmentation/coverage plot
+### Run this AFTER: the RPM matrix load chunk (needs rpm_matrix, convert)
+###             AND: the barplots chunk (needs shared_de, hervquant_mat)
+
+# reverse hervQuant's log2(RPM+1) back to linear RPM, preserving true zeros
+hervquant_rpm_mat <- hervquant_mat
+hervquant_rpm_mat[hervquant_rpm_mat != 0] <-
+  2^hervquant_rpm_mat[hervquant_rpm_mat != 0] - 1
+
+# hervQuant summary (mean + SE) directly in RPM space, one row per locus
+hervquant_raw_long_rpm <- hervquant_rpm_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("hervquant") %>%
+  pivot_longer(-hervquant, names_to = "sample_id", values_to = "rpm")
+
+hervquant_summary_rpm <- hervquant_raw_long_rpm %>%
+  group_by(hervquant) %>%
+  summarise(mean_value = mean(rpm, na.rm = TRUE),
+            se = sd(rpm, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+# HERV-db summary directly in RPM space (using rpm_matrix, not log2_rpm_matrix)
+hervdb_raw_long_rpm <- rpm_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("hervdb") %>%
+  pivot_longer(-hervdb, names_to = "sample_id", values_to = "rpm") %>%
+  filter(hervdb %in% shared_de)
+
+hervdb_summary_rpm <- hervdb_raw_long_rpm %>%
+  group_by(hervdb) %>%
+  summarise(mean_value = mean(rpm, na.rm = TRUE),
+            se = sd(rpm, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop") %>%
+  mutate(dataset = "hervdb")
+
+# map each hervdb locus to its hervquant group (if any); unmatched -> 0
+hervdb_to_hervquant <- convert %>%
+  filter(hervdb %in% shared_de) %>%
+  distinct(hervdb, hervquant)
+
+hervquant_matched_rpm <- tibble(hervdb = shared_de) %>%
+  left_join(hervdb_to_hervquant, by = "hervdb") %>%
+  left_join(hervquant_summary_rpm, by = "hervquant") %>%
+  mutate(
+    matched_in_hervquant = !is.na(hervquant),
+    mean_value = if_else(is.na(mean_value), 0, mean_value),
+    se = if_else(is.na(se), 0, se),
+    dataset = "hervquant"
+  ) %>%
+  select(hervdb, mean_value, se, dataset, matched_in_hervquant)
+
+plot_summary_rpm <- bind_rows(
+  hervdb_summary_rpm %>% mutate(matched_in_hervquant = NA),
+  hervquant_matched_rpm
+)
+
+ggplot(plot_summary_rpm, aes(x = dataset, y = mean_value, fill = dataset)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = mean_value - se, ymax = mean_value + se), width = 0.25) +
+  facet_wrap(~ hervdb, scales = "free_y", nrow = 2) +
+  scale_fill_manual(values = c("hervdb" = "darkviolet", "hervquant" = "darkgreen")) +
+  labs(x = "", y = "Normalized expression (RPM)", fill = "",
+       title = "HERV-db captures loci absent from or merged in hervQuant") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+
+#ggsave("output/hervquant_v_telescope_bar_facet_linear.pdf", width = 12, height = 6)
+```
+
+```{r}
+# concordance recomputed on linear RPM instead of log2, fresh + unfiltered (all loci, not just shared_de)
+hervdb_all_long_rpm <- rpm_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("hervdb") %>%
+  pivot_longer(-hervdb, names_to = "sample_id", values_to = "rpm")
+
+concordance_data_rpm <- hervdb_all_long_rpm %>%
+  filter(hervdb %in% convert_matched$hervdb) %>%
+  left_join(convert_matched, by = "hervdb") %>%
+  group_by(hervquant, sample_id) %>%
+  summarise(hervdb_rpm_summed = sum(rpm), .groups = "drop") %>%
+  inner_join(hervquant_raw_long_rpm, by = c("hervquant", "sample_id")) %>%
+  rename(hervquant_rpm = rpm)
+
+locus_summary_rpm <- concordance_data_rpm %>%
+  group_by(hervquant) %>%
+  summarise(mean_hervdb = mean(hervdb_rpm_summed),
+            mean_hervquant = mean(hervquant_rpm),
+            .groups = "drop")
+
+nrow(locus_summary_rpm)   # sanity check -- should be close to the full shared-locus count
+
+cor_result_rpm <- cor.test(locus_summary_rpm$mean_hervdb, locus_summary_rpm$mean_hervquant, method = "spearman")
+cor_result_rpm
+
+p_concordance <- ggplot(locus_summary, aes(x = mean_hervquant, y = mean_hervdb)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick") +
+  labs(
+    title = "Concordance of shared HERV loci between databases",
+    subtitle = paste0("Spearman rho = ", round(cor_result_rpm$estimate, 3),
+                       ", p = ", format.pval(cor_result_rpm$p.value, digits = 2)),
+    x = "hervQuant mean log2(RPM)",
+    y = "HERV-db mean log2(RPM)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+
+print(p_concordance)
+#ggsave("output/concordance_plot_linear.pdf", height = 6, width = 8)
+
+### smooth plot
+ggplot(locus_summary_rpm, aes(x = mean_hervquant, y = mean_hervdb)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick") +
+  labs(title = "Concordance (linear RPM, arithmetic mean)",
+       subtitle = paste0("Spearman rho = ", round(cor_result_rpm$estimate, 3)),
+       x = "hervQuant mean RPM", y = "HERV-db mean RPM") +
+  theme_minimal(base_size = 13)
+
+#ggsave("output/concordance_plot_linear_smooth.pdf", height = 6, width = 8)
+```
+
+```{r fixed concordance}
+# log2 version: recompute cor_result fresh on current locus_summary
+cor_result <- cor.test(locus_summary$mean_hervdb, locus_summary$mean_hervquant, method = "spearman")
+cor_result
+
+p_concordance_log2 <- ggplot(locus_summary, aes(x = mean_hervquant, y = mean_hervdb)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick") +
+  labs(
+    title = "Concordance of shared HERV loci between databases (log2 RPM)",
+    subtitle = paste0("Spearman rho = ", round(cor_result$estimate, 3),
+                       ", p = ", format.pval(cor_result$p.value, digits = 2)),
+    x = "hervQuant mean log2(RPM)",
+    y = "HERV-db mean log2(RPM)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+
+print(p_concordance_log2)
+#ggsave("output/concordance_plot_log2.pdf", plot = p_concordance_log2, height = 6, width = 8)
+
+# linear version
+p_concordance_linear <- ggplot(locus_summary_rpm, aes(x = mean_hervquant, y = mean_hervdb)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick") +
+  labs(title = "Concordance (linear RPM, arithmetic mean)",
+       subtitle = paste0("Spearman rho = ", round(cor_result_rpm$estimate, 3),
+                          ", p = ", format.pval(cor_result_rpm$p.value, digits = 2)),
+       x = "hervQuant mean RPM", y = "HERV-db mean RPM") +
+  theme_minimal(base_size = 13)
+  #ylim(0,25) + xlim(0,25)
+
+print(p_concordance_linear)
+#ggsave("output/concordance_plot_linear_smooth.pdf", plot = p_concordance_linear, height = 6, width = 8)
+```
+
+```{r -- is hervquant +1 pseudocount?}
+range(hervquant_mat)
+sum(hervquant_mat == 0)                        # how many exact zeros
+sort(unique(as.vector(hervquant_mat)))[1:15]   # smallest non-zero values
+```
+
+```{r additional plots}
+# concordance with hervdb-exclusive HERVs
+```

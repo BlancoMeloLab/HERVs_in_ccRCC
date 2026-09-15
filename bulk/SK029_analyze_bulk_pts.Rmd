@@ -1,0 +1,251 @@
+---
+title: "analyzing bulk RNAseq"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load}
+library(DESeq2) 
+library(RColorBrewer)
+library(pheatmap)
+library(viridis)
+library(ggplot2)
+library(tximport)
+library(edgeR)
+library(patchwork)
+library(tidyverse)
+library(reshape2)
+library(data.table)
+library(stringr)
+library(readxl)
+library(ggVennDiagram)
+library(readr)
+library(clusterProfiler)
+library(biomaRt)
+library(MetBrewer)
+library(ggpubr)
+library(rstatix)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(msigdbr)
+```
+
+```{r format counts}
+# Read in per-sample counts files and merge into a single matrix;
+# features absent from a given sample are assigned 0 counts
+files <- list.files("data/counts/", pattern = "*.tsv", full.names = TRUE)
+names(files) <- basename(files)
+data_list <- lapply(files, read.table, header = TRUE)
+merged_data <- Reduce(function(x, y) merge(x, y, by = "feature_id", all = TRUE), data_list)
+colnames(merged_data) <- c("feature_id", names(data_list))
+merged_data[is.na(merged_data)] <- 0
+merged_data <- merged_data %>% dplyr::filter(!str_detect(feature_id, "^_"))
+colnames(merged_data) <- gsub("_S\\d+_L001.combined_counts.tsv", "", colnames(merged_data))
+#write.csv(merged_data, "data/counts_merged.csv", quote = F, row.names = F)
+```
+
+```{r DESEQ2}
+counts <- read.csv("data/counts_merged.csv", row.names = 1)
+
+# metadata
+samples <- data.frame(
+  tsv_file_name = colnames(counts),
+  condition = c(rep(c("normal", "tumor"), 8)),
+  ptid = c(rep("P1", 2), rep("P3", 2), rep("P4", 2), rep("K130", 2),
+           rep("K19", 2), rep("K24", 2), rep("K93", 2), rep("K97", 2)),
+  batch = c(rep("A", 6), rep("B", 2), rep("C", 4), rep("B", 4))
+)
+samples$sample_id <- paste0(samples$ptid, "_", samples$condition)
+samples <- samples[match(colnames(counts), samples$tsv_file_name), ]
+
+sampleTable <- data.frame(
+  condition = factor(samples$condition),
+  sample_id = factor(samples$sample_id),
+  ptid = factor(samples$ptid),
+  batch = factor(samples$batch)
+)
+
+colnames(counts) <- sampleTable$sample_id
+rownames(sampleTable) <- sampleTable$sample_id
+
+# run DESeq2, controlling for patient identity
+dds <- DESeqDataSetFromMatrix(counts, 
+                                colData = sampleTable,
+                                design = ~ ptid + condition)
+
+dds <- DESeq(dds)
+```
+
+```{r PCA}
+vsd <- vst(dds, blind = FALSE)
+plotPCA(vsd, intgroup = c("condition")) +
+  scale_color_manual(values = c("#F8766D", "#00BFC4")) +
+  ggtitle("ccRCC patients PCA") +
+  theme_classic()
+
+plotPCA(vsd, intgroup = c("batch")) +
+  scale_color_manual(values = c("#F8766D", "#00BFC4", "gray")) +
+  ggtitle("ccRCC patients PCA") +
+  theme_classic()
+
+#ggsave("output/ccrcc_patients_pca.pdf", width = 6, height = 6)
+```
+
+```{r run contrasts}
+res_TvsN <- results(dds, contrast = c("condition", "normal", "tumor"))
+res_TvsN <- res_TvsN[complete.cases(res_TvsN), ]
+result_TvsN <- res_TvsN[order(res_TvsN$padj), ]
+
+all_res <- data.frame(result_TvsN) %>% filter(str_detect(rownames(.), "RBRT"))
+
+DEH <- data.frame(result_TvsN[which(abs(result_TvsN$log2FoldChange) > 1 & result_TvsN$padj < 0.05), ])
+#write.csv(DEH, "output/deg_results.csv", row.names = T, quote = F)
+DEH <- DEH %>%
+  filter(str_detect(rownames(DEH), "RBRT")) %>%
+  filter(log2FoldChange <= -1) %>%
+  arrange(log2FoldChange, desc(baseMean)) %>%
+  mutate(idx = row.names(.))
+
+#write.csv(DEH, "output/deh_results.csv", quote = F)
+```
+
+
+```{r MA plot}
+# top down-regulated HERV gene names for MA plot labeling
+gene_names <- all_res %>% filter(log2FoldChange < 0) %>% arrange(log2FoldChange)
+gene_names <- as.vector(row.names(gene_names))
+gene_names <- gene_names[1:15]
+
+ggmaplot(all_res, main = "MA plot of tumor vs normal DE HERVs",
+   fdr = 0.05, fc = 2, size = 0.4,
+   palette = c("#B31B21", "#1465AC", "darkgray"),
+   label.select = gene_names,
+   legend = "top", top = 0,
+   font.label = c("bold", 11),
+   font.legend = "bold",
+   font.main = "bold",
+   ggtheme = ggplot2::theme_minimal())
+
+#ggsave("output/ma_de_herv.pdf", width = 5, height = 5)
+```
+
+```{r}
+cpm <- cpm(counts)
+
+hoi <- DEH$idx[which(DEH$Prev_idx %in% selected_hervs)]
+cpm <- as.data.frame(cpm) %>% filter(row.names(cpm) %in% hoi)
+
+cpm <- t(cpm)
+row.names(sampleTable) <- sampleTable$sample_id
+cpm <- merge(cpm, sampleTable, by = "row.names")
+
+cpm <- gather(as.data.frame(cpm), key = "herv", value = "value", c(RBRT304117:RBRT442033))
+
+my_comparisons <- list(c("normal", "tumor"))
+
+summary_data <- cpm %>%
+  group_by(condition, herv) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE),
+            sd_value = sd(value, na.rm = TRUE))
+
+stats_results <- cpm %>%
+  group_by(herv) %>%
+  t_test(value ~ condition) %>%
+  adjust_pvalue(method = "none") %>%
+  add_significance("p") %>%
+  add_xy_position(x = "condition", scales = "free_y", step.increase = 0.25)
+
+gg_list <- list()
+for (i in unique(cpm$herv)) {
+  data <- cpm[which(cpm$herv[] == i), ]
+  summary_sub <- summary_data[which(summary_data$herv == i), ]
+  stats_sub <- stats_results[which(stats_results$herv == i), ]
+  gg_list[[i]] <- ggplot(data, aes(x = condition, y = value, group = ptid)) +
+    labs(title = paste(i)) +
+    theme_classic() +
+    geom_line(aes(color = ptid)) +
+    geom_point() +
+    theme(text = element_text(size = 20), axis.text.x = element_text(size = 20)) +
+    ylab("CPM") +
+    geom_errorbar(data = summary_sub,
+                  aes(x = condition, y = mean_value,
+                      ymin = mean_value - sd_value,
+                      ymax = mean_value + sd_value, group = condition),
+                  width = 0.2,
+                  color = "black") +
+    stat_pvalue_manual(stats_sub,
+                        label = "p.signif",
+                        tip.length = 0.01,
+                        size = 3,
+                        hide.ns = FALSE)
+
+  print(gg_list[[i]])
+  #ggsave(filename = paste0("output/cpm_", i, ".pdf"), width = 6, height = 6)
+}
+```
+
+```{r bar plots of HERVE}
+cpm <- cpm(counts)
+
+hoi <- DEH$idx
+cpm <- as.data.frame(cpm) %>% filter(row.names(cpm) %in% hoi)
+
+cpm <- t(cpm)
+row.names(sampleTable) <- sampleTable$sample_id
+cpm <- merge(cpm, sampleTable, by = "row.names")
+
+cpm <- gather(as.data.frame(cpm), key = "herv", value = "value", c(RBRT11613:RBRT95990))
+
+my_comparisons <- list(c("normal", "tumor"))
+
+summary_data <- cpm %>%
+  group_by(condition, herv) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE),
+            sd_value = sd(value, na.rm = TRUE))
+
+stats_results <- cpm %>%
+  group_by(herv) %>%
+  t_test(value ~ condition) %>%
+  adjust_pvalue(method = "none") %>%
+  add_significance("p") %>%
+  add_xy_position(x = "condition", scales = "free_y", step.increase = 0.25)
+
+gg_list <- list()
+for (i in unique(cpm$herv)) {
+  data <- cpm[which(cpm$herv[] == i), ]
+  summary_sub <- summary_data[which(summary_data$herv == i), ]
+  stats_sub <- stats_results[which(stats_results$herv == i), ]
+  gg_list[[i]] <- ggplot(data, aes(x = condition, y = value, group = ptid)) +
+    labs(title = paste(i)) +
+    theme_classic() +
+    geom_line(aes(color = ptid)) +
+    geom_point() +
+    theme(text = element_text(size = 20), axis.text.x = element_text(size = 20)) +
+    ylab("CPM") +
+    geom_errorbar(data = summary_sub,
+                  aes(x = condition, y = mean_value,
+                      ymin = mean_value - sd_value,
+                      ymax = mean_value + sd_value, group = condition),
+                  width = 0.2,
+                  color = "black") +
+    stat_pvalue_manual(stats_sub,
+                        label = "p.signif",
+                        tip.length = 0.01,
+                        size = 3,
+                        hide.ns = FALSE)
+
+  print(gg_list[[i]])
+  #ggsave(filename = paste0("output/cpm_", i, ".pdf"), width = 6, height = 6)
+}
+```
+
+```{r families of DE HERVs}
+DEH <- read.csv("data/results/deh_results.csv")
+hervdb <- read.table("data/annotations/hervs_8k.gtf", sep = "\t") %>%
+  mutate(family = str_extract(V9, "gene_id .*; tr")) %>%
+  dplyr::select(V2, family)
+colnames(hervdb)[1] <- "idx"
+
+DEH <- left_join(DEH, hervdb)
+```
