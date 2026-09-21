@@ -1,0 +1,271 @@
+---
+title: "FLAIR analysis"
+output: html_document
+date: "2026-09-16"
+---
+
+```{r load libraries}
+library(data.table)
+library(tidyverse)
+library(readxl)
+library(pheatmap)
+library(viridis)
+library(PNWColors)
+library(ggtranscript)
+library(ggplot2)
+library(dplyr)
+library(rtracklayer)
+library(biomaRt)
+```
+
+```{r load data}
+# load bedtools intersect results: HERVdb, flair gtf
+herv_int_50<- read.table("herv_intersect_50ov.bed", sep = "\t") %>% filter(V15 == "gene")
+
+# load flair quant counts
+counts<-read.table("flair_quant.counts.tsv")
+```
+
+```{r plot isoform usage}
+herv<- ""
+isos<- herv_int_50 %>% filter(str_detect(V21, herv)) %>% dplyr::select(V4)
+subcounts<- counts %>% filter(ids %in% isos$V4)
+
+colnames(subcounts)
+subcounts<- pivot_longer(subcounts, cols= -ids)
+subcounts <- subcounts %>% mutate(condition = str_extract(name, "_.*_"))
+subcounts$condition<- gsub("healthy", "normal", subcounts$condition)
+subcounts$condition<- gsub("_", "", subcounts$condition)
+
+subcounts <- subcounts %>% mutate(sample = str_extract(name, "^K\\d+\\w")) %>%  mutate(pt = str_extract(name, "^K\\d+")) %>% filter(!str_detect(name,"depleted")) %>% na.omit()
+
+### expression
+
+pal<- pnw_palette("Sailboat", 5)
+
+df_plot <- subcounts %>%
+  mutate(value_signed = ifelse(condition == "normal", -value, value))
+
+ggplot(df_plot, aes(x = sample, y = value_signed, fill = ids)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3,
+           position = position_dodge()) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  scale_fill_manual(values = pal) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.1, 0.1)),
+    limits = c(-max(df_plot$value), max(df_plot$value)),
+    labels = function(x) abs(x)
+  ) +
+  annotate("text", x = -Inf, y = Inf,  label = "Tumor",  hjust = -0.2, vjust = 1.5) +
+  annotate("text", x = -Inf, y = -Inf, label = "Normal", hjust = -0.2, vjust = -0.5) +
+  labs(x = "Patient", y = "Expression",
+       fill = "Isoform", title = paste0( herv)) +
+  theme_classic(base_size = 30) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "none")
+
+```
+
+```{r plot isoforms}
+gtf <- import("SK031_combined.gtf")
+
+exons <- as.data.frame(gtf) %>%
+  filter(type == "exon") %>%
+  dplyr::select(seqnames, start, end, strand, transcript_id, gene_id)
+
+ 
+exons_sub <- exons %>%
+  filter(str_detect(transcript_id, "43635-1_ENST00000647830.2_6"))
+ 
+
+introns_sub <- to_intron(exons_sub, group_var = "transcript_id")
+ 
+### plot 
+
+p <- ggplot(exons_sub, aes(
+  xstart = start, xend = end, y = transcript_id
+)) +
+  geom_range(
+    aes(fill = gene_id),
+    height = 0.25
+  ) +
+  geom_intron(
+    data = introns_sub,
+    aes(strand = strand),
+    arrow.min.intron.length = 200
+  ) +
+  facet_wrap(~ gene_id, scales = "free_x", ncol = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 13)
+  ) +
+  labs(
+    x = "Genomic position",
+    title = paste("Transcript models")
+  )
+ 
+print(p)
+
+```
+
+
+```{r with ref genes}
+
+ref_gtf <- import("ref.gtf")
+ref_gtf_df <- as.data.frame(ref_gtf)
+
+ref_gtf_df <- ref_gtf_df %>%
+  mutate(gene_name = ifelse(is.na(gene_name) | gene_name == "", gene_id, gene_name))
+
+
+ref_exons_true <- ref_gtf_df %>%
+  filter(type == "exon") %>%
+  dplyr::select(seqnames, start, end, strand, transcript_id, gene_name)
+
+# For transcripts with NO exon rows at all
+#    fall back to using the transcript-level row itself as one exon block
+transcripts_with_exons <- unique(ref_exons_true$transcript_id)
+
+ref_exons_fallback <- ref_gtf_df %>%
+  filter(type == "transcript", !transcript_id %in% transcripts_with_exons) %>%
+  dplyr::select(seqnames, start, end, strand, transcript_id, gene_name)
+
+ref_exons_all <- bind_rows(ref_exons_true, ref_exons_fallback)
+
+# --- Specify the two genes novel transcript spans ---
+spanned_genes <- c("RBRT304117", "CERNA2")
+
+# checks 
+unique(ref_gtf_df$gene_name)[grepl("RBRT304117", unique(ref_gtf_df$gene_name), ignore.case = TRUE)]
+unique(ref_gtf_df$gene_id)[grepl("RBRT304117", unique(ref_gtf_df$gene_id), ignore.case = TRUE)]
+
+ref_gtf_df %>% filter(gene_id == "RBRT304117" | gene_name == "RBRT304117") %>% dplyr::select(type, start, end, gene_id, gene_name)
+
+
+### specifying the transcript 
+## filter
+ref_gtf_tx <- ref_gtf_df %>% filter(gene_name == spanned_genes[2] & type == "transcript")
+## manually choose ref tx
+ref_exons_rep <- ref_exons_all %>% filter(transcript_id %in% "ENST00000398733.8_8" | gene_name == spanned_genes[1])
+
+unique(ref_exons_rep$gene_name)
+
+exons_sub$source <- "FLAIR (novel)"
+ref_exons_rep$source <- "Reference"
+
+exons_sub$gene_name <- paste(spanned_genes, collapse = " / ")
+
+combined_exons <- bind_rows(exons_sub, ref_exons_rep)
+
+# --- Derive introns for the combined set ---
+combined_introns <- to_intron(combined_exons, group_var = "transcript_id")
+
+tx_to_gene <- combined_exons %>% distinct(transcript_id, gene_name)
+combined_introns <- combined_introns %>%
+  dplyr::select(-any_of("gene_name")) %>%
+  left_join(tx_to_gene, by = "transcript_id")
+
+# --- Order rows: novel transcript first, then the two reference genes ---
+gene_order <- c(unique(exons_sub$gene_name), spanned_genes)
+combined_exons$gene_name <- factor(combined_exons$gene_name, levels = gene_order)
+combined_introns$gene_name <- factor(combined_introns$gene_name, levels = gene_order)
+
+# --- Plot: single genomic-coordinate x-axis so the spanning relationship
+p_span <- ggplot(combined_exons, aes(
+  xstart = start, xend = end, y = gene_name
+)) +
+  geom_range(aes(fill = source), height = 0.25) +
+  geom_intron(
+    data = combined_introns,
+    aes(strand = strand),
+    arrow.min.intron.length = 200
+  ) +
+  scale_fill_manual(values = c("FLAIR (novel)" = "#6e7cb9", "Reference" = "navyblue")) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "none"
+  ) +
+  labs(
+    x = "Genomic position (chr10) ",
+    title =""
+  )
+
+print(p_span)
+
+```
+
+```{r version with additional HERV transcripts}
+herv<- ""
+
+isos <- herv_int_50 %>%
+  filter(str_detect(V21, herv)) %>%
+  pull(V4) %>%
+  unique()
+
+isos
+
+transcript_ids_clean <- str_replace(isos, "_[^_]+$", "")
+
+## Pull exon structure for these isoforms from the FLAIR-derived `exons` df
+iso_exons <- exons %>%
+  filter(transcript_id %in% transcript_ids_clean ) %>%
+  dplyr::select(seqnames, start, end, strand, transcript_id, gene_id)
+
+iso_exons$source <- "Isoform"
+
+## ref_exons_rep already has source = "Reference" from the chunk above
+combined_all <- bind_rows(ref_exons_rep, iso_exons)
+
+combined_all_introns <- to_intron(combined_all, group_var = "transcript_id")
+
+tx_to_group <- combined_all %>% distinct(transcript_id, gene_name, source)
+combined_all_introns <- combined_all_introns %>%
+  dplyr::select(-any_of(c("gene_name", "source"))) %>%
+  left_join(tx_to_group, by = "transcript_id")
+
+## Row identity: reference genes plot by gene_name, isoforms plot by transcript_id
+combined_all <- combined_all %>%
+  mutate(plot_row = if_else(source == "Reference", gene_name, transcript_id))
+combined_all_introns <- combined_all_introns %>%
+  mutate(plot_row = if_else(source == "Reference", gene_name, transcript_id))
+
+## Order: reference genes on top, then isoforms below
+row_order <- c(spanned_genes, sort(unique(iso_exons$transcript_id)))
+combined_all$plot_row <- factor(combined_all$plot_row, levels = rev(row_order))
+combined_all_introns$plot_row <- factor(combined_all_introns$plot_row, levels = rev(row_order))
+
+combined_all <- combined_all %>%
+  mutate(plot_row_label = str_trunc(as.character(plot_row), width = 15, side = "right"))
+
+combined_all_introns <- combined_all_introns %>%
+  mutate(plot_row_label = str_trunc(as.character(plot_row), width = 15, side = "right"))
+
+# Keep the same ordering, but apply it to the new truncated label column
+truncated_order <- str_trunc(row_order, width = 15, side = "right")
+combined_all$plot_row_label <- factor(combined_all$plot_row_label, levels = rev(truncated_order))
+combined_all_introns$plot_row_label <- factor(combined_all_introns$plot_row_label, levels = rev(truncated_order))
+
+p_isoforms <- ggplot(combined_all, aes(xstart = start, xend = end, y = plot_row_label)) +
+  geom_range(aes(fill = source), height = 0.25) +
+  geom_intron(data = combined_all_introns, aes(strand = strand),
+              arrow.min.intron.length = 200) +
+  scale_fill_manual(values = c("Reference" = "navyblue", "Isoform" = "#6e7cb9")) +
+  theme_minimal(base_size = 12) +
+  theme(axis.title.y = element_blank(), panel.grid.minor = element_blank(),
+        legend.title = element_blank()) +
+  labs(x = "Genomic position", title = "")
+
+print(p_isoforms)
+```
+
+
+
+
+
+

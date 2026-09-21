@@ -1,0 +1,226 @@
+---
+title: "FLAIR TSS analysis"
+output: html_document
+date: "2026-09-21"
+---
+
+```{r load libraries}
+library(dplyr)
+library(tidyverse)
+library(biomaRt)
+library(viridisLite)
+library(edgeR)
+library(ggplot2)
+library(reshape2)
+library(stringr)
+library(scales)
+library(pheatmap)
+library(PNWColors)
+```
+
+```{r TSS - LTR intersection}
+# load bedtools intersect results for TSS window (20bp) and repbase ltrs 
+tss_only_int<- read.table("FLAIR_TSS_tx_repbase_int.gtf", sep ="\t")
+repbase_ltrs<- read.table("repbase_LTRs.gtf", sep ="\t") %>% mutate(ltr = str_extract(V9, "-.*; t"))
+repbase_ltrs$ltr<- gsub("-", "", repbase_ltrs$ltr)
+repbase_ltrs$ltr<- gsub("; t", "", repbase_ltrs$ltr)
+repbase_sum<- repbase_ltrs %>% group_by(ltr) %>% summarize(total=n()) %>% arrange(desc(total))
+
+tss_only_int <- tss_only_int %>% mutate(ltr = str_extract(V15, "-.*; t"))
+
+tss_only_int$ltr<- gsub("-", "", tss_only_int$ltr)
+tss_only_int$ltr<- gsub("; t", "", tss_only_int$ltr)
+
+# group by ltr, plot normalized
+
+tss_only_int_sum<- tss_only_int %>% group_by(ltr) %>% summarize(n=n()) %>% arrange(desc(n))
+
+tss_only_int_sum<- left_join(tss_only_int_sum, repbase_sum)
+
+tss_only_int_sum<- tss_only_int_sum %>% mutate(norm = n/total) %>% arrange(desc(norm))
+
+
+pal <- pnw_palette("Lake",20)
+
+tss_only_int_sum %>% head(n =15) %>%
+  ggplot(aes(x = reorder(ltr, desc(norm)), y =norm, fill = ltr, label = n)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_classic() +
+  xlab("") +
+  theme(legend.position = "null", axis.text.x = element_text(angle = 45,  vjust = 1, hjust = 1)) +
+  ylab("# transcripts with HERV TSS (norm)") +
+  geom_text(aes(label = n), vjust = -0.5, size = 3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = pal) +
+  ggtitle("norm by family size")
+
+
+#### by LTR
+## unique LTRs / total ltrs in that family
+
+tss_only_int_ltr<- tss_only_int %>% group_by(ltr) %>% summarize(unique_ltrs = length(unique(V8))) %>% arrange(desc(unique_ltrs))
+
+tss_only_int_ltr<- left_join(tss_only_int_ltr, repbase_sum) %>% mutate(norm = unique_ltrs / total) %>% arrange(desc(norm), desc(unique_ltrs))
+
+pal <- pnw_palette("Starfish",15)
+
+tss_only_int_ltr %>% head(n =15) %>% 
+  ggplot(aes(x = reorder(ltr, desc(norm)), y =norm, fill = ltr, label = unique_ltrs)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_classic(base_size = 18) +
+  xlab("") +
+  theme(legend.position = "null", axis.text.x = element_text(angle = 45,  vjust = 1, hjust = 1)) +
+  ylab("Enrichment per LTR type") +
+  geom_text(aes(label = unique_ltrs), vjust = -0.5, size = 5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = pal) +
+  ggtitle("")
+
+```
+
+```{r LTR - gene}
+tss_only_int <- tss_only_int %>% 
+  mutate(idx = str_extract(V15, "B\\d+")) %>% 
+  mutate(gene = str_extract(V4, "ENSG\\d+")) # strip version
+
+ensembl <- useEnsembl(biomart = "genes",mirror = "useast",  dataset = "hsapiens_gene_ensembl")
+gene_info <- getBM(mart = ensembl, values = tss_only_int$gene, 
+                    filters = "ensembl_gene_id",
+                    attributes = c("ensembl_transcript_id_version",
+                                   "external_gene_name",
+                                   "ensembl_gene_id_version",
+                                   "ensembl_gene_id",
+                                   "entrezgene_id", 
+                                   "transcript_start",
+                                   "transcript_end",
+                                   "transcription_start_site"))
+
+counts <- read.table("flair_quant.counts.tsv", sep = "\t", header = T)
+tss_counts <- data.frame(counts) %>% 
+  filter(ids %in% tss_only_int$V4) %>% 
+  select(c(ids, K130N1_healthy_batch1, K130T4_tumor_batch1, K97N2_healthy_batch1, K97T3_tumor_batch1))
+
+row.names(tss_counts) <- tss_counts$ids
+tss_counts <- as.matrix(tss_counts[, -1])
+
+annotation <- data.frame(id = colnames(tss_counts),
+                          condition = c("normal", "tumor", "normal", "tumor"))
+row.names(annotation) <- annotation$id
+
+# normalize
+cpm <- cpm(tss_counts) %>% as.data.frame()
+
+tumor_samples <- c("K130T4_tumor_batch1", "K97T3_tumor_batch1")
+normal_samples <- c("K130N1_healthy_batch1", "K97N2_healthy_batch1")
+
+# calculate lfc
+lfc <- cpm %>%
+  mutate(
+    tumor_mean = rowMeans(across(all_of(tumor_samples))),
+    normal_mean = rowMeans(across(all_of(normal_samples))),
+    log2FC = log2((normal_mean + 1) / (tumor_mean + 1))
+  ) %>%
+  select(log2FC)
+
+lfc_subset <- lfc %>%
+  filter(abs(log2FC) >= 2)
+
+min(lfc_subset$log2FC)
+max(lfc_subset$log2FC)
+
+# plot 
+mat <- lfc_subset %>% as.matrix()
+
+pheatmap(mat,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = F,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-10, 10, length.out = 101),
+  main = "Log2 Fold Change (Tumor vs Normal)",
+  angle_col = 0
+)
+
+### add gene classification
+lfc_subset <- lfc_subset %>% rownames_to_column("V4")
+
+# join on V4 to bring in the gene (ENSG) column from tss_only_int
+lfc_tss <- left_join(lfc_subset, tss_only_int, by = "V4")
+
+gene_info_key <- left_join(lfc_tss, gene_info, by = c("gene" = "ensembl_gene_id")) %>%
+  select(gene, V4, log2FC, external_gene_name, ensembl_gene_id_version) %>%
+  distinct()
+
+gene_info_key$external_gene_name[which(gene_info_key$external_gene_name == "")] <- NA
+gene_info_key <- gene_info_key %>% mutate(gene_final = coalesce(external_gene_name, gene))
+
+# assign the rest of the NAs to novel or HERV
+gene_info_key <- gene_info_key %>% 
+  mutate(gene_name = ifelse(is.na(gene_final) == TRUE, V4, gene_final)) %>% 
+  filter(!str_detect(gene_name, "RBRT"))
+gene_info_key$gene_name <- make.unique(gene_info_key$gene_name)
+
+gene_info_mat <- gene_info_key %>% 
+  column_to_rownames("gene_name") %>% 
+  select(log2FC) %>% 
+  arrange(desc(log2FC))
+
+#### filter annotated HERV
+gene_info_mat <- gene_info_mat %>% filter(!row.names(.) == "ERVE-1")
+
+## top/bottom 10 by log2FC
+gene_info_mat_sub <- rbind(head(gene_info_mat, n = 10), tail(gene_info_mat, n = 10))
+
+pheatmap(gene_info_mat_sub,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = T,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-15, 15, length.out = 100),
+  main = "Log2 Fold Change (Tumor vs Normal)",
+  angle_col = 0
+)
+
+```
+
+
+```{r plot TSS position}
+flairbed <- read.table("flair_combined.bed", sep = "\t")
+colnames(tss_only_int)[2:3] <- c("tss_start", "tss_end")
+
+df_plot <- tss_only_int %>%
+  left_join(flairbed, by = "V4") %>%
+  mutate(
+    tss_mid   = (tss_start + tss_end) / 2,
+    rel_start = ifelse(V6.x == "+", V10.x - tss_mid, tss_mid - V11.x),
+    rel_end   = ifelse(V6.x == "+", V11.x - tss_mid, tss_mid - V10.x)
+  )
+
+# subset and fix y consistently
+df_plot_sub <- df_plot %>%
+  filter(ltr == "LTR2B") %>%
+  mutate(V4_trunc = str_trunc(V4, 16)) %>%
+  arrange(V8.x, V4) %>% 
+  mutate(
+    y = factor(paste0(V8.x, " | ", V4),
+               levels = unique(paste0(V8.x, " | ", V4)))
+  ) 
+
+ggplot(df_plot_sub) +
+  geom_rect(aes(xmin = rel_start, xmax = rel_end,
+                ymin = as.numeric(y) - 0.3, ymax = as.numeric(y) + 0.3),
+            fill = "steelblue", color = "black", linewidth = 0.2) +
+  annotate("rect", xmin = -10, xmax = 10,
+           ymin = -Inf, ymax = Inf,
+           fill = "red", alpha = 0.1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.8) +
+  scale_y_continuous(
+    breaks = seq_len(nlevels(df_plot_sub$y)),
+    labels = paste0(sub(" \\|.*", "", levels(df_plot_sub$y)), " | ",                str_trunc(sub(".*\\| ", "", levels(df_plot_sub$y)), 16)),
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(x = "Position of LTR relative to TSS (bp)", y = "LTR2B w/ associated transcripts") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 7))
+```
+
