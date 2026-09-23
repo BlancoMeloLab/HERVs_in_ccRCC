@@ -1,14 +1,17 @@
-##HERVs in ccRCC
+## HERVs in ccRCC
 
 This is the analysis code for the paper "Tumor-specific HARLEQUIN endogenous retrovirus expression in clear cell Renal Cell Carcinoma", separated into:
 
-###bulk
+### bulk
 - includes scripts for the analysis of bulk RNAseq data
 
-###long-read
+### long-read
 - includes FLAIR gtf and scripts for analysis of PacBio Kinnex Full-Length RNAseq data
 
-###single-cell
+### single-cell
 - includes scripts for analysis of Chromium 10x flex single-cell RNAseq data and subsequent SCENIC analysis
+
+### nextflow
+- includes nextflow .nf for processing TCGA-KIRC data 
 
 All raw data and additional processed data files are accessible through GEO.
