@@ -1,0 +1,130 @@
+---
+title: "10x flex analysis"
+output: html_document
+date: "2026-09-21"
+---
+
+```{r load }
+library(Seurat)
+library(dplyr)
+library(harmony)
+library(stringr)
+library(UCell)
+library(Azimuth)
+library(cowplot)
+library(ggplot2) # must be version 3.5.2
+library(patchwork)
+library(presto)
+library(ggridges)
+library(PNWColors)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(PNWColors)
+
+set.seed(123)
+
+options(future.globals.maxSize = 8000 * 1024^2)
+
+combined<- readRDS()
+```
+
+```{r annotate cell types with azimuth}
+
+combined = JoinLayers(combined, assay = "RNA")
+combined <- RunAzimuth(combined, reference = "kidneyref")
+
+colnames(combined@meta.data)
+pal <- pnw_palette("Starfish",15)
+
+p1 <- DimPlot(combined, group.by = "predicted.annotation.l1", label = TRUE, label.size = 3, cols = pal) + NoLegend()
+p1
+
+p2 <- DimPlot(combined, group.by = "tissue_type", label = F)
+p1 + p2
+p1
+```
+
+```{r harlequin score}
+Idents(combined)<- combined$seurat_clusters
+
+# combining 3 best harl and pan 
+markers<- list()
+markers$harlequin<- c("RBRT14036", "RBRT3381", "RBRT94151", "PAN-HARL")
+
+data.seurat <- AddModuleScore_UCell(combined, features = markers,
+    ncores = 4)
+
+
+hist(data.seurat$harlequin_UCell)
+
+data.seurat<- subset(x = data.seurat, idents = c(0,1,3,6, 11,14, 7,10,12,19))
+hist(data.seurat$harlequin_UCell)
+
+pal <- pnw_palette("Starfish",10)
+Idents(data.seurat) <- factor(
+  Idents(data.seurat),
+  levels = c( "6", "7", "10", "12", "19",  "14", "11", "0", "1", "3")
+)
+
+VlnPlot(object = data.seurat, features = "harlequin_UCell", idents = c(6, 0,1,3, 11, 14, 7, 10,12, 19), pt.size = 0, cols = rev(pal))
+```
+
+```{r pathway analysis based on harlequin groups}
+Idents(combined)<- combined$seurat_clusters
+
+# combining 3 best harl and pan in main tumor clusters
+markers<- list()
+markers$harlequin<- c("RBRT14036", "RBRT3381", "RBRT94151", "PAN-HARL")
+
+data.seurat <- AddModuleScore_UCell(combined, features = markers,
+    ncores = 4)
+
+data.seurat<- subset(x = data.seurat, idents = c(0,1,3,11,14))
+
+hist(data.seurat$harlequin_UCell)
+
+data.seurat@meta.data <- data.seurat@meta.data %>%
+  mutate(harl_group = ifelse(harlequin_UCell >= 0.25, "high", "low"))
+Idents(data.seurat)<- data.seurat$harl_group
+
+
+harl.markers <- FindMarkers(data.seurat, ident.1 = "high", ident.2 = "low" , min.pct = 0.25,test.use = "wilcox_limma")  %>% arrange(avg_log2FC) %>% mutate(id = row.names(.))
+
+
+#### hallmark
+msig_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene) %>%
+  dplyr::rename(ont = gs_name, gene = entrez_gene)
+
+gene_df <- bitr(rownames(harl.markers), 
+                fromType = "SYMBOL", 
+                toType   = "ENTREZID", 
+                OrgDb    = org.Hs.eg.db)
+
+# join entrez IDs back to DE results
+harl_entrez <- harl.markers %>%
+  mutate(SYMBOL = rownames(.)) %>%
+  left_join(gene_df, by = "SYMBOL") %>%
+  filter(!is.na(ENTREZID))
+
+# create named vector of log2FC ranked by value
+gene_list <- setNames(harl_entrez$avg_log2FC, harl_entrez$ENTREZID)
+gene_list <- sort(gene_list, decreasing = TRUE)
+
+msig_gsea <- GSEA(gene_list, 
+                  TERM2GENE     = msig_h, 
+                  pvalueCutoff  = 0.05,
+                  pAdjustMethod = "BH",
+                  verbose       = TRUE)
+
+msig_gsea
+
+# plot
+dotplot(msig_gsea, showCategory = 20) + ggtitle("harl expressor vs non-expressor (hallmark)")
+```
+
+
+
+
+

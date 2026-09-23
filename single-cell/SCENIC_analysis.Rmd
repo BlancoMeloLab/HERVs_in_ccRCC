@@ -1,0 +1,322 @@
+---
+title: "SCENIC output analysis"
+output: html_document
+date: "2026-09-22"
+---
+
+```{r setup}
+library(AUCell)
+library(data.table)
+library(dplyr)
+library(tibble)
+library(stringr)
+library(SCopeLoomR)
+library(SummarizedExperiment)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(SCENIC)
+library(Seurat)
+library(pheatmap)
+library(ggplot2)
+library(RColorBrewer)
+library(PNWColors)
+library(reshape2)
+
+data_dir <- "path/to/data"
+out_dir  <- "path/to/output"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+prefix   <- format(Sys.Date(), "%Y-%m-%d")
+
+scenic_loom_path   <- file.path(data_dir, "scenic/multi_runs_looms/multi_runs_regulons_auc_mtf.loom")
+regulon_freq_path  <- file.path(data_dir, "scenic/multi_runs_regulons_mtf/regulons.tsv")
+seurat_obj_path    <- file.path(data_dir, "combined_processed.rds")
+homer_known_path   <- file.path(data_dir, "homer/LTR2B_FLAIR_output/knownResults.txt")
+hervdb_path        <- file.path(data_dir, "Data_S1_dryad_high_support.tsv")
+herv_id_conv_path  <- file.path(data_dir, "small_hervdb_convert.csv")
+
+# helper: pheatmap with the styling used throughout this script
+plot_regulon_heatmap <- function(mat, title, fontsize = 10) {
+  pheatmap(mat,
+           cluster_rows = TRUE, cluster_cols = TRUE,
+           clustering_method = "mcquitty",
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           main = title,
+           color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+           show_rownames = TRUE, show_colnames = TRUE,
+           border_color = NA, legend = TRUE,
+           annotation_legend = FALSE, fontsize = fontsize)
+}
+
+# helper: top-N regulons per column of a regulon x cluster matrix
+top_n_regulons <- function(mat, n) {
+  unique(unlist(lapply(colnames(mat), function(cl) {
+    rownames(as.data.frame(mat) %>% arrange(desc(.data[[cl]])) %>% head(n))
+  })))
+}
+```
+
+```{r load scenic output}
+# https://htmlpreview.github.io/?https://github.com/aertslab/SCENIC/blob/master/Tutorials_JupyterNotebooks/SCENIC_tutorial_2-ExploringOutput.html
+
+loom <- open_loom(scenic_loom_path)
+exprMat     <- get_dgem(loom)
+exprMat_log <- log2(exprMat + 1)
+regulons_incidMat <- get_regulons(loom, column.attr.name = "Regulons")
+regulons          <- regulonsToGeneLists(regulons_incidMat)
+regulonAUC            <- get_regulons_AUC(loom, column.attr.name = "RegulonsAUC")
+regulonAucThresholds  <- get_regulon_thresholds(loom)
+embeddings            <- get_embeddings(loom)
+close_loom(loom)
+
+# cluster assignments from the processed Seurat object
+combined <- readRDS(seurat_obj_path)
+cellClusters <- data.frame(
+  cell_id = rownames(combined@meta.data),
+  cluster = combined@meta.data[["seurat_clusters"]]
+)
+rownames(cellClusters) <- cellClusters$cell_id
+
+selectedResolution <- "cluster"
+cellsPerCluster <- split(rownames(cellClusters), cellClusters[, selectedResolution])
+regulonAUC <- regulonAUC[onlyNonDuplicatedExtended(rownames(regulonAUC)), ]
+
+# mean AUC per cluster, then z-scored across clusters
+regulonActivity_byCellType <- sapply(cellsPerCluster, function(cells) {
+  rowMeans(getAUC(regulonAUC)[, cells])
+})
+regulonActivity_byCellType_Scaled <- t(scale(t(regulonActivity_byCellType), center = TRUE, scale = TRUE))
+
+topRegulators <- melt(regulonActivity_byCellType_Scaled, varnames = c("Regulon", "CellType"),
+                      value.name = "RelativeActivity")
+topRegulators$CellType <- factor(as.character(topRegulators$CellType))
+topRegulators <- topRegulators[topRegulators$RelativeActivity > 0, ]
+
+# keep only regulons reproducible in >= 80% of SCENIC runs
+run_freq <- read.table(regulon_freq_path, sep = "\t", header = TRUE) %>%
+  filter(count >= 80) %>%
+  mutate(id   = gsub("\\(\\+\\)", "_\\(\\+\\)", regulon),
+         TF   = gsub("\\(\\+\\)", "", regulon),
+         s_id = gsub("_", "-", id))
+
+topRegulators <- topRegulators %>% filter(Regulon %in% run_freq$id)
+
+# write.csv(topRegulators, file.path(out_dir, paste0(prefix, "_SCENIC_topRegulators_nruns80.csv")), quote = FALSE)
+# write.csv(regulonActivity_byCellType_Scaled, file.path(out_dir, paste0(prefix, "_SCENIC_regulonActivity_byCellType_Scaled.csv")), quote = FALSE)
+
+tumor_clusters <- c("0", "1", "3", "6", "11", "14", "19", "7", "10", "12")
+topRegulators %>% filter(CellType %in% tumor_clusters) %>% distinct(Regulon)
+```
+
+```{r dotplot of top regulons per cluster}
+df_long_top <- melt(regulonActivity_byCellType_Scaled, varnames = c("regulon", "cluster"), value.name = "auc") %>%
+  group_by(cluster) %>%
+  arrange(desc(auc)) %>%
+  slice(1:3)
+
+regulonActivity_scaled_plot <- as.data.frame(regulonActivity_byCellType_Scaled) %>%
+  filter(row.names(.) %in% df_long_top$regulon) %>%
+  as.matrix()
+
+df_long <- melt(regulonActivity_scaled_plot, varnames = c("regulon", "cluster"), value.name = "auc")
+df_long$regulon <- factor(df_long$regulon, levels = df_long_top$regulon)
+
+ggplot(df_long, aes(x = factor(cluster), y = regulon, color = auc)) +
+  geom_point(alpha = 0.8, size = 3) +
+  scale_color_distiller(palette = "Spectral", direction = -1) +
+  theme_minimal(base_size = 14) +
+  labs(x = "Cluster", y = NULL, color = "AUC score")
+ggsave(file.path(out_dir, paste0(prefix, "_AUCell_scores_per_cluster.pdf")), height = 8.5, width = 11)
+
+# write.csv(df_long, file.path(out_dir, paste0(prefix, "_filtered_top_regulons.csv")), row.names = FALSE, quote = FALSE)
+# write.csv(regulonActivity_byCellType_Scaled, file.path(out_dir, paste0(prefix, "_all_regulons.csv")), quote = FALSE)
+```
+
+```{r heatmap of regulon activity by cluster}
+plot_regulon_heatmap(regulonActivity_byCellType_Scaled, "Average regulon activity per cluster")
+ggsave(file.path(out_dir, paste0(prefix, "_AUCell_scores_per_cluster.pdf")), height = 8.5, width = 11)
+
+kidney_clusters <- c("0", "1", "3", "6", "11", "14")
+regulonActivity_byCellType_Scaled_kidney <- regulonActivity_byCellType_Scaled[, kidney_clusters]
+
+plot_regulon_heatmap(regulonActivity_byCellType_Scaled_kidney,
+                     "Average regulon activity per cluster: kidney only")
+ggsave(file.path(out_dir, paste0(prefix, "_AUCell_scores_per_cluster_kidney.pdf")), height = 8.5, width = 11)
+```
+
+```{r calc RSS}
+rss <- calcRSS(AUC = getAUC(regulonAUC),
+               cellAnnotation = cellClusters[colnames(regulonAUC), selectedResolution])
+
+plotRSS_oneSet(rss, setName = "3")
+# ggsave(file.path(out_dir, paste0(prefix, "_RSS_scores_cluster3.pdf")), height = 6, width = 6)
+# write.csv(rss, file.path(out_dir, paste0(prefix, "_SCENIC_RSS.csv")), quote = FALSE)
+```
+
+```{r heatmaps of top RSS/AUC regulons per cluster}
+rss_clusters <- c("0", "1", "3", "6", "11", "14", "7", "10", "12", "19")
+rss_sub <- as.data.frame(rss[, rss_clusters]) %>% filter(row.names(.) %in% topRegulators$Regulon)
+auc_sub <- regulonActivity_byCellType_Scaled[, rss_clusters]
+
+# top regulons ranked by specificity (RSS), n = 10 and n = 5 per cluster
+top_rss_10 <- top_n_regulons(rss_sub, 10)
+top_rss_5  <- top_n_regulons(rss_sub, 5)
+
+plot_regulon_heatmap(as.matrix(rss_sub[top_rss_10, ]),
+                     "Top RSS hits for kidney clusters, nruns = 80")
+
+plot_regulon_heatmap(as.data.frame(auc_sub) %>% filter(row.names(.) %in% top_rss_10) %>% as.matrix(),
+                     "AUC for top specificity hits (RSS-ranked), nruns = 80")
+
+plot_regulon_heatmap(as.data.frame(auc_sub) %>% filter(row.names(.) %in% top_rss_5) %>% as.matrix(),
+                     "AUC for top specificity hits (RSS-ranked, top 5), nruns = 80", fontsize = 17)
+
+# top regulons ranked by activity (AUC) instead of specificity
+top_auc_10 <- top_n_regulons(as.data.frame(auc_sub), 10)
+
+plot_regulon_heatmap(as.data.frame(auc_sub) %>% filter(row.names(.) %in% top_auc_10) %>% as.matrix(),
+                     "AUC for top regulons, ranked by AUC, nruns = 80")
+```
+
+```{r HOMER motifs in expressed LTR2Bs}
+combined$cluster_condition <- paste0(combined$seurat_clusters, "_", combined$tissue_type)
+Idents(combined) <- "cluster_condition"
+combined <- JoinLayers(combined)
+
+known_homer <- read.table(homer_known_path, sep = "\t")
+colnames(known_homer) <- c("MotifName", "consensus", "P-value", "LogP-value", "q-value",
+                           "# of Target Sequences with Motif", "perc of Target Sequences with Motif",
+                           "# of Background Sequences with Motif", "perc of Background Sequences with Motif")
+
+known_homer <- known_homer %>%
+  mutate(regulon = toupper(gsub("\\(.*\\)", "", MotifName)),
+         regulon = gsub("\\w+-MYC", "MYC", regulon),
+         regulon = str_extract(regulon, "\\w+/"),
+         regulon = gsub("\\/", "", regulon),
+         regulon = paste0(regulon, "_(+)"),
+         `perc of Target Sequences with Motif` = as.numeric(str_extract(`perc of Target Sequences with Motif`, "\\d+.\\d+")),
+         fdr = p.adjust(`P-value`, method = "BH")) %>%
+  filter(fdr < 0.05)
+
+known_homer_sub <- known_homer %>%
+  dplyr::select(MotifName, `perc of Target Sequences with Motif`, `P-value`, regulon) %>%
+  arrange(desc(`perc of Target Sequences with Motif`)) %>%
+  filter(regulon %in% topRegulators$Regulon)
+known_homer_sub <- known_homer_sub[-14, ]  # duplicate motif hit
+
+pal <- pnw_palette("Starfish", 20)
+known_homer_sub$regulon <- factor(known_homer_sub$regulon,
+                                  levels = c("HOXA13_(+)", "CUX1_(+)", "SMAD3_(+)", "ELF5_(+)", "PDX1_(+)",
+                                             "HOXC10_(+)", "HOXA2_(+)", "HOXA1_(+)", "ELF4_(+)", "TCF3_(+)",
+                                             "STAT6_(+)", "BCL11A_(+)", "TEAD4_(+)", "IRF8_(+)", "SPIB_(+)"))
+
+ggplot(known_homer_sub, aes(x = reorder(regulon, -`perc of Target Sequences with Motif`),
+                            y = `perc of Target Sequences with Motif`, fill = regulon)) +
+  geom_bar(position = "stack", stat = "identity") +
+  theme_classic(base_size = 18) +
+  xlab("regulon") + ylab("% of Target Sequences with Motif") +
+  theme(axis.text.x = element_text(hjust = 1, vjust = .95, angle = 45), legend.position = "none") +
+  ggtitle("HOMER motifs in expressed LTR2Bs") +
+  scale_fill_manual(values = pal) +
+  scale_y_continuous(expand = c(0, 0))
+ggsave(file.path(out_dir, paste0(prefix, "_homer_ltr2b_motifs_top_scenic_auc.pdf")), width = 7, height = 6)
+```
+
+```{r regulon-HERV correlation helper}
+# Correlate AUC of each regulon with expression of each HERV probe, per cell,
+# then join in HERV family/locus annotation for plotting
+compute_regulon_herv_corr <- function(tfs, genes, cells, method = "spearman") {
+  auc_mat  <- getAUC(regulonAUC)[tfs, cells, drop = FALSE]
+  expr_mat <- exprMat[genes, cells, drop = FALSE]
+
+  expand.grid(regulon = tfs, gene = genes, stringsAsFactors = FALSE) %>%
+    rowwise() %>%
+    mutate(correlation = cor(as.numeric(auc_mat[regulon, ]),
+                             as.numeric(expr_mat[gene, cells]),
+                             method = method, use = "pairwise.complete.obs")) %>%
+    ungroup()
+}
+
+annotate_herv_corr <- function(cor_results, gene_order, new_order) {
+  hervdb <- read.table(hervdb_path, sep = "\t", header = TRUE) %>%
+    dplyr::select(locus_id, RE_name) %>%
+    rename(new = locus_id)
+  conv <- read.csv(herv_id_conv_path, header = FALSE)
+  colnames(conv) <- c("new", "gene")
+
+  cor_results %>%
+    mutate(gene = factor(gene, levels = gene_order)) %>%
+    left_join(conv) %>%
+    left_join(hervdb) %>%
+    group_by(regulon) %>%
+    mutate(harlequin_avg_corr = mean(correlation[RE_name == "HARLEQUIN"], na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(regulon = factor(regulon, levels = rev(unique(regulon[order(-harlequin_avg_corr)]))),
+           new = factor(new, levels = new_order))
+}
+
+plot_herv_corr_heatmap <- function(cor_results, method_label = "spearman") {
+  ggplot(cor_results, aes(x = new, y = regulon, fill = correlation)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(correlation, 2)), size = 3, color = "black") +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-1, 1)) +
+    labs(x = "HERV (expression)", y = "Regulon (AUC)", fill = paste0(method_label, "\ncorrelation")) +
+    theme_minimal(base_size = 15) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+}
+
+herv_probes <- c("RBRT14036", "RBRT3381", "RBRT94151", "RBRT111722",
+                 "RBRT76522", "RBRT51651", "RBRT132380", "RBRT101401")
+herv_gene_order <- c("RBRT101401", "RBRT51651", "RBRT132380", "RBRT111722",
+                     "RBRT76522", "RBRT3381", "RBRT14036", "RBRT94151")
+herv_new_order <- c("RBRT190212", "RBRT442488", "RBRT488297", "RBRT226772",
+                    "RBRT95990", "RBRT11613", "RBRT304117", "RBRT162940")
+
+Idents(combined) <- "seurat_clusters"
+epi <- subset(combined, idents = kidney_clusters)
+all_cells <- colnames(epi)
+```
+
+```{r correlation: regulons with a HOMER-supported motif}
+de_reg_TVN <- FindMarkers(combined, ident.1 = "6_Normal",
+                          ident.2 = c("0_Tumor", "1_Tumor", "3_Tumor", "11_Tumor", "14_Tumor"),
+                          logfc.threshold = 0, min.pct = 0, min.diff.pct = -Inf) %>%
+  filter(row.names(.) %in% run_freq$s_id) %>%
+  arrange(avg_log2FC)
+row.names(de_reg_TVN) <- gsub("-", "_", row.names(de_reg_TVN))
+
+homer_tfs <- unique(row.names(as.data.frame(de_reg_TVN) %>% filter(row.names(.) %in% known_homer_sub$regulon)))
+
+cor_results <- compute_regulon_herv_corr(homer_tfs, herv_probes, all_cells) %>%
+  annotate_herv_corr(herv_gene_order, herv_new_order)
+
+plot_herv_corr_heatmap(cor_results)
+ggsave(file.path(out_dir, paste0(prefix, "_correlation_herv_exp_regAUC_homer_ltr2b.pdf")), width = 8, height = 6)
+```
+
+```{r correlation: all DE regulons, top 15 by summed correlation}
+# fix dash / underscore
+homer_tf_fix <- c("NKX3_1" = "NKX3-1", "NKX3_2" = "NKX3-2", "NKX2_8" = "NKX2-8",
+                  "NKX2_3" = "NKX2-3", "NKX6_2" = "NKX6-2")
+all_de_tfs <- str_replace_all(unique(row.names(de_reg_TVN)), homer_tf_fix)
+
+'%notin%' <- Negate('%in%')
+missing_tfs <- all_de_tfs[all_de_tfs %notin% regulonAUC@NAMES]  # not scored by SCENIC, dropped below
+all_de_tfs <- setdiff(all_de_tfs, missing_tfs)
+
+cor_results_all <- compute_regulon_herv_corr(all_de_tfs, herv_probes, all_cells)
+
+top_tfs <- cor_results_all %>%
+  group_by(regulon) %>%
+  summarise(abs_sum = sum(abs(correlation))) %>%
+  arrange(desc(abs_sum)) %>%
+  slice(1:15) %>%
+  pull(regulon)
+
+cor_results_top <- cor_results_all %>%
+  filter(regulon %in% top_tfs) %>%
+  annotate_herv_corr(herv_gene_order, herv_new_order)
+
+plot_herv_corr_heatmap(cor_results_top)
+ggsave(file.path(out_dir, paste0(prefix, "_correlation_herv_exp_regAUC_enhancer.pdf")), width = 8, height = 6)
+```

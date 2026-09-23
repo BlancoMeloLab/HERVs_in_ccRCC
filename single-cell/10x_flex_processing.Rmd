@@ -1,0 +1,135 @@
+---
+title: "10x flex processing"
+output: html_document
+date: "2026-09-21"
+---
+
+
+```{r load}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(harmony)
+library(UCell)
+
+set.seed(123)
+options(future.globals.maxSize = 8000 * 1024^2)
+
+data_dir <- "path/to/data"
+out_dir  <- "path/to/output"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+prefix <- format(Sys.Date(), "%Y-%m-%d")
+```
+
+```{r sample sheet}
+samples <- data.frame(
+  sample      = c("K97_N", "K130_N", "K97_T", "K130_T"),
+  patient     = c("K97", "K130", "K97", "K130"),
+  tissue_type = c("Normal", "Normal", "Tumor", "Tumor"),
+  gem         = c("GEM1", "GEM1", "GEM2", "GEM2")
+)
+samples$matrix_dir <- file.path(data_dir, samples$sample,
+                                "sample_filtered_feature_bc_matrix")
+```
+
+```{r load data}
+seurat_list <- lapply(seq_len(nrow(samples)), function(i) {
+  s <- samples[i, ]
+  obj <- CreateSeuratObject(Read10X(data.dir = s$matrix_dir),
+                            project = s$sample,
+                            min.cells = 3, min.features = 200)
+  obj$sample      <- s$sample
+  obj$patient     <- s$patient
+  obj$tissue_type <- s$tissue_type
+  obj$gem         <- s$gem
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj
+})
+
+combined <- merge(seurat_list[[1]],
+                  y = seurat_list[-1],
+                  add.cell.ids = samples$sample,
+                  project = "FlexProject")
+rm(seurat_list); gc()
+
+table(combined$sample)
+```
+
+```{r qc}
+VlnPlot(combined,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        group.by = "sample", pt.size = 0.1, ncol = 3)
+
+FeatureScatter(combined, "nCount_RNA", "percent.mt", group.by = "sample") +
+  FeatureScatter(combined, "nCount_RNA", "nFeature_RNA", group.by = "sample")
+
+combined <- subset(combined,
+                   subset = nFeature_RNA > 300 &
+                            nFeature_RNA < 5000 &
+                            percent.mt < 5)
+
+ncol(combined)
+```
+
+```{r remove doublets}
+# Convert to SingleCellExperiment
+sce.combined <- JoinLayers(combined)
+sce.combined <- as.SingleCellExperiment(sce.combined, assay = "RNA")
+
+# Compute doublets
+set.seed(10010101)
+sce <- scDblFinder(sce.combined,
+                   clusters=T,
+                   samples=sce.combined$gem, 
+                   multiSampleMode="split", 
+                   dims=30,
+                   includePCs=1:30, 
+                   verbose=TRUE) 
+
+combined$doublet_score <- sce$scDblFinder.score
+combined$doublet_class <- sce$scDblFinder.class
+
+# Filter out doublets AND low-quality cells
+combined <- subset(combined, subset = doublet_class == "singlet" & 
+                                       nFeature_RNA > 200 & 
+                                       nFeature_RNA < 5000 & 
+                                       percent.mt < 10)
+
+## cell cycle regression
+s.genes <- c(cc.genes.updated.2019$s.genes)
+g2m.genes <- c(cc.genes.updated.2019$g2m.genes)
+combined <- CellCycleScoring(combined, s.features = s.genes, g2m.features = g2m.genes)
+
+combined <- ScaleData(combined, vars.to.regress = c("S.Score", "G2M.Score")) 
+combined <- RunPCA(combined)
+combined <- RunUMAP(combined, dims = 1:30)
+combined <- FindNeighbors(combined, dims = 1:30)
+combined <- FindClusters(combined, resolution = 0.5)
+```
+
+
+```{r harmony integration}
+combined <- combined %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA()
+
+combined <- RunHarmony(combined, group.by.vars = "gem", reduction.use = "pca")
+
+combined <- combined %>%
+  FindNeighbors(reduction = "harmony", dims = 1:30) %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(reduction = "harmony", dims = 1:30)
+
+saveRDS(combined, file.path(out_dir, "harmony_integrated.rds"))
+```
+
+```{r umaps}
+for (var in c("tissue_type", "sample", "patient", "gem")) {
+  DimPlot(combined, reduction = "umap", group.by = var)
+  ggsave(file.path(out_dir, paste0(prefix, "_UMAP_", var, ".pdf")),
+         height = 6, width = 8)
+}
+```
