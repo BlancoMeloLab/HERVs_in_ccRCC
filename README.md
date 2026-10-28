@@ -12,6 +12,9 @@ This is the analysis code for the paper "Tumor-specific HARLEQUIN endogenous ret
 - includes scripts for analysis of Chromium 10x flex single-cell RNAseq data and subsequent SCENIC analysis
 
 ### nextflow
-- includes nextflow .nf for processing TCGA-KIRC data 
+- includes nextflow .nf for processing TCGA-KIRC data and NWBT patient data
 
-All raw data and additional processed data files are accessible through GEO.
+All raw data and additional processed data files are accessible through GEO:
+GSE347188 (bulk)
+GSE347185 (long-read)
+GSE347187 (single-cell)
