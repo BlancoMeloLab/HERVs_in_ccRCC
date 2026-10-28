@@ -14,7 +14,7 @@ This is the analysis code for the paper "Tumor-specific HARLEQUIN endogenous ret
 ### nextflow
 - includes nextflow .nf for processing TCGA-KIRC data and NWBT patient data
 
-All raw data and additional processed data files are accessible through GEO:
-GSE347188 (bulk)
-GSE347185 (long-read)
-GSE347187 (single-cell)
+All raw data and additional processed data files are accessible through GEO:\\\\
+GSE347188 (bulk)\\\\
+GSE347185 (long-read)\\\\
+GSE347187 (single-cell)\\\\
