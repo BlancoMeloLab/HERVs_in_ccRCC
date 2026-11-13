@@ -1,0 +1,164 @@
+---
+title: "Pseudobulk DE analysis by cell type (tumor vs normal)"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+library(Seurat)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(Matrix)
+library(DESeq2)
+library(ggplot2)
+library(EnhancedVolcano)
+
+set.seed(123)
+options(future.globals.maxSize = 8000 * 1024^2)
+
+setwd("path/to/working_directory/")
+```
+
+### Pseudobulking by cell type
+```{r pseudobulk_by_celltype}
+combined <- readRDS("path/to/processed_seurat_object_with_cell_type.rds")
+
+# ---- settings ---------------------------------------------------------------
+celltype_col   <- "predicted.annotation.l1"   # metadata column with cell type labels
+min_cells      <- 125   # min cells per patient x tissue x cell type pseudobulk
+min_patients   <- 2     # min patients with BOTH Normal and Tumor for a cell type
+herv_pattern   <- "RBRT|PAN\\-"
+
+# ---- 1. raw counts ----------------------------------------------------------
+obj    <- JoinLayers(combined, assay = "RNA")
+counts <- LayerData(obj, assay = "RNA", layer = "counts")
+meta   <- obj@meta.data
+stopifnot(identical(rownames(meta), colnames(counts)))
+
+# # drop cells with no annotation
+# keep   <- !is.na(meta[[celltype_col]])
+# counts <- counts[, keep]
+# meta   <- meta[keep, ]
+
+meta$celltype <- as.character(meta[[celltype_col]])
+meta$pb_id    <- paste(meta$patient, meta$tissue_type, meta$celltype, sep = "|")
+
+# ---- 2. sum counts per patient x tissue x cell type -------------------------
+f <- factor(meta$pb_id)
+M <- sparseMatrix(i = seq_along(f), j = as.integer(f), x = 1,
+                  dims = c(length(f), nlevels(f)),
+                  dimnames = list(colnames(counts), levels(f)))
+pb_counts <- counts %*% M
+
+# ---- 3. pseudobulk sample table ---------------------------------------------
+coldata <- meta %>%
+  dplyr::group_by(pb_id, patient, tissue_type, celltype) %>%
+  dplyr::summarise(n_cells = dplyr::n(), .groups = "drop") %>%
+  as.data.frame()
+rownames(coldata) <- coldata$pb_id
+coldata <- coldata[colnames(pb_counts), ]
+
+# overview: pseudobulks per cell type and condition
+print(table(coldata$celltype, coldata$tissue_type))
+
+# ---- 4. DESeq2 within each cell type ----------------------------------------
+run_deseq_ct <- function(ct) {
+  cd <- coldata %>% dplyr::filter(celltype == ct, n_cells >= min_cells)
+
+  # keep only patients that still have both conditions
+  paired <- cd %>%
+    dplyr::group_by(patient) %>%
+    dplyr::summarise(n_cond = dplyr::n_distinct(tissue_type), .groups = "drop") %>%
+    dplyr::filter(n_cond == 2) %>%
+    dplyr::pull(patient)
+  cd <- cd[cd$patient %in% paired, ]
+
+  if (dplyr::n_distinct(cd$patient) < min_patients) {
+    message("Skipping ", ct, ": only ", dplyr::n_distinct(cd$patient),
+            " paired patients")
+    return(NULL)
+  }
+
+  cd$patient   <- droplevels(factor(cd$patient))
+  cd$condition <- relevel(factor(cd$tissue_type), ref = "Normal")
+
+  cts <- round(as.matrix(pb_counts[, rownames(cd)]))
+  cts <- cts[rowSums(cts >= 10) >= 2, , drop = FALSE]   # drop very low-count genes
+
+  dds <- DESeqDataSetFromMatrix(cts, cd, design = ~ patient + condition)
+  dds <- tryCatch(DESeq(dds, sfType = "poscounts"),     # robust size factors for sparse counts
+                  error = function(e) { message("DESeq failed for ", ct, ": ",
+                                                conditionMessage(e)); NULL })
+  if (is.null(dds)) return(NULL)
+
+  res <- results(dds, contrast = c("condition", "Tumor", "Normal"))
+  as.data.frame(res) %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::mutate(celltype = ct,
+                  n_patients = dplyr::n_distinct(cd$patient),
+                  n_genes_tested = nrow(cts))
+}
+
+cell_types <- sort(unique(coldata$celltype))
+res_list   <- lapply(cell_types, run_deseq_ct)
+names(res_list) <- cell_types
+res_all <- dplyr::bind_rows(res_list)
+
+# ---- 5. are HERVs DE? -------------------------------------------------------
+res_herv <- res_all %>%
+  dplyr::filter(str_detect(gene, herv_pattern)) %>%
+  dplyr::filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  dplyr::arrange(celltype, padj)
+res_herv
+
+# HERVs tested per cell type (shows what the expression filter removed)
+res_all %>%
+  dplyr::filter(str_detect(gene, herv_pattern)) %>%
+  dplyr::count(celltype, name = "n_HERVs_tested")
+
+## convert HERV ids (old probe ID -> new ID)
+res_all$gene <- gsub("RBRT14036",  "RBRT304117", res_all$gene)
+res_all$gene <- gsub("RBRT3381",   "RBRT11613",  res_all$gene)
+res_all$gene <- gsub("RBRT94151",  "RBRT162940", res_all$gene)
+res_all$gene <- gsub("RBRT111722", "RBRT226772", res_all$gene)
+res_all$gene <- gsub("RBRT76522",  "RBRT95990",  res_all$gene)
+res_all$gene <- gsub("RBRT132380", "RBRT488297", res_all$gene)
+
+table(res_all$celltype)
+```
+
+```{r volcano_plots}
+genes_to_label <- c("CA9", "CD70", "PAN-HARL", "RBRT11613", "RBRT304117",
+                    "RBRT162940", "RBRT226772", "NDUFA4L2")
+
+plot_volcano <- function(ct, outfile) {
+  tvn <- res_all %>% dplyr::filter(celltype == ct)
+
+  p <- EnhancedVolcano(tvn,
+                       lab = tvn$gene,
+                       selectLab = genes_to_label,
+                       x = "log2FoldChange",
+                       y = "padj",
+                       title = paste0("Pseudobulk DEGs: Tumor vs Normal (", ct, ")"),
+                       subtitle = "",
+                       FCcutoff = 1,
+                       col = c("grey70", "grey70", "grey70", "firebrick"),
+                       legendPosition = "right",
+                       legendLabSize = 18,
+                       legendIconSize = 5.0,
+                       labSize = 6,
+                       drawConnectors = TRUE,
+                       max.overlaps = 500)
+
+  ggsave(p, filename = outfile, device = "pdf", width = 11, height = 7.5)
+  invisible(p)
+}
+
+# cell type label (must match values in celltype_col) -> output file
+plot_volcano("Descending Thin Limb", "pseudobulk_DEG_volcano_DTL.pdf")
+plot_volcano("Proximal Tubule",      "pseudobulk_DEG_volcano_PT.pdf")
+plot_volcano("Immune",               "pseudobulk_DEG_volcano_immune.pdf")
+plot_volcano("Endothelial",          "pseudobulk_DEG_volcano_endothelial.pdf")
+```
